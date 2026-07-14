@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Gravity Insurance</title>
+    <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+    <div class="page-shell">
+    <header class="hero">
+        <p class="eyebrow">Insurance Dashboard</p>
+        <h1>Gravity Insurance</h1>
+        <p class="subheading">Customer quote pages</p>
+    </header>
+    <nav class="top-menu">
+        <a class="{{NAV_HOME_CLASS}}" href="/">Home</a>
+        <a class="{{NAV_LEADS_CLASS}}" href="/leads">Leads</a>
+        <a class="{{NAV_ACTIVE_CLASS}}" href="/active-clients">Active Client</a>
+        <a class="{{NAV_EXPIRY_CLASS}}" href="/expiry-alerts">Expiry Alerts</a>
+        <a class="{{NAV_SENDQUOTE_CLASS}}" href="/send-quote">Send Quote</a>
+    </nav>
+
+    <div class="page-content">
+        {{PAGE_CONTENT}}
+    </div>
+    </div>
+    <script>
+        const toggleButton = document.getElementById("toggleAddForm");
+        const form = document.getElementById("addCustomerForm");
+
+        if (toggleButton && form) {
+            toggleButton.addEventListener("click", function () {
+                form.classList.toggle("is-hidden");
+            });
+        }
+    </script>
+</body>
+</html>

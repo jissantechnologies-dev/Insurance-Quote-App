@@ -1,0 +1,178 @@
+[
+    {
+        "name": "Saravanan",
+        "age": 35,
+        "mobileNumber": "9941456453",
+        "carType": "SUV",
+        "carBrand": "Hyundai",
+        "carModel": "Creta",
+        "yearOfManufacture": 2021,
+        "PolicyNumber": "ROY2607001",
+        "policyExpiryDate": "2026-07-14"
+    },
+    {
+        "name": "Ravi",
+        "age": 28,
+        "mobileNumber": "9123456780",
+        "carType": "Sedan",
+        "carBrand": "Honda",
+        "carModel": "City",
+        "yearOfManufacture": 2020,
+        "PolicyNumber": "TAT2607002",
+        "policyExpiryDate": "2026-11-30"
+    },
+    {
+        "name": "Kousigan",
+        "age": 20,
+        "mobileNumber": "9988776655",
+        "carType": "Hatchback",
+        "carBrand": "Maruti Suzuki",
+        "carModel": "Baleno",
+        "yearOfManufacture": 2022,
+        "PolicyNumber": "HDF2607003",
+        "policyExpiryDate": "2027-05-20"
+    },
+    {
+        "name": "Balaji",
+        "age": 25,
+        "mobileNumber": "9001122334",
+        "carType": "Commercial Van",
+        "carBrand": "Tata",
+        "carModel": "Ace",
+        "yearOfManufacture": 2019,
+        "PolicyNumber": "ICI2607004",
+        "policyExpiryDate": "2026-09-10"
+    },
+    {
+        "name": "Jishnu",
+        "age": "39",
+        "mobileNumber": "9025325123",
+        "carType": "Bus",
+        "carBrand": "Ashok Leyland",
+        "carModel": "Viking",
+        "yearOfManufacture": "2016",
+        "PolicyNumber": "BAJ2607005",
+        "policyExpiryDate": "2026-07-10"
+    },
+    {
+        "name": "Meena",
+        "age": 42,
+        "mobileNumber": "9876543201",
+        "carType": "Lorry",
+        "carBrand": "BharatBenz",
+        "carModel": "4228R",
+        "yearOfManufacture": 2018,
+        "PolicyNumber": "REL2607006",
+        "policyExpiryDate": "2026-12-19"
+    },
+    {
+        "name": "Aravind",
+        "age": 33,
+        "mobileNumber": "9360123456",
+        "carType": "Commercial Pickup",
+        "carBrand": "Mahindra",
+        "carModel": "Bolero Pickup",
+        "yearOfManufacture": 2022,
+        "PolicyNumber": "SBI2607007",
+        "policyExpiryDate": "2026-10-03"
+    },
+    {
+        "name": "Deepa",
+        "age": 31,
+        "mobileNumber": "9500033344",
+        "carType": "SUV",
+        "carBrand": "Kia",
+        "carModel": "Seltos",
+        "yearOfManufacture": 2023,
+        "PolicyNumber": "CHO2607008",
+        "policyExpiryDate": "2026-08-28"
+    },
+    {
+        "name": "Naresh",
+        "age": 46,
+        "mobileNumber": "9011122299",
+        "carType": "Truck",
+        "carBrand": "Eicher",
+        "carModel": "Pro 3015",
+        "yearOfManufacture": 2017,
+        "PolicyNumber": "TOK2607009",
+        "policyExpiryDate": "2026-07-20"
+    },
+    {
+        "name": "Priya",
+        "age": 29,
+        "mobileNumber": "9444455511",
+        "carType": "Coupe",
+        "carBrand": "Hyundai",
+        "carModel": "i20 N Line",
+        "yearOfManufacture": 2024,
+        "PolicyNumber": "ROY2607010",
+        "policyExpiryDate": "2027-01-05"
+    },
+    {
+        "name": "Vignesh",
+        "age": 37,
+        "mobileNumber": "9345678123",
+        "carType": "Sedan",
+        "carBrand": "Toyota",
+        "carModel": "Camry",
+        "yearOfManufacture": 2021,
+        "PolicyNumber": "NIA2607011",
+        "policyExpiryDate": "2026-09-22"
+    },
+    {
+        "name": "Divya",
+        "age": 27,
+        "mobileNumber": "9812345670",
+        "carType": "Hatchback",
+        "carBrand": "Tata",
+        "carModel": "Altroz",
+        "yearOfManufacture": 2022,
+        "PolicyNumber": "UNI2607012",
+        "policyExpiryDate": "2026-08-15"
+    },
+    {
+        "name": "Karthik",
+        "age": 41,
+        "mobileNumber": "9645123870",
+        "carType": "SUV",
+        "carBrand": "Mahindra",
+        "carModel": "XUV700",
+        "yearOfManufacture": 2023,
+        "PolicyNumber": "NAT2607013",
+        "policyExpiryDate": "2027-02-11"
+    },
+    {
+        "name": "Anitha",
+        "age": 34,
+        "mobileNumber": "9788456123",
+        "carType": "Commercial Van",
+        "carBrand": "Force Motors",
+        "carModel": "Traveller",
+        "yearOfManufacture": 2019,
+        "PolicyNumber": "FUT2607014",
+        "policyExpiryDate": "2026-10-30"
+    },
+    {
+        "name": "Suresh",
+        "age": 45,
+        "mobileNumber": "9900112233",
+        "carType": "Truck",
+        "carBrand": "Ashok Leyland",
+        "carModel": "Dost+",
+        "yearOfManufacture": 2020,
+        "PolicyNumber": "LIB2607015",
+        "policyExpiryDate": "2026-11-05"
+    },
+    {
+        "name": "Nandhini",
+        "age": "43",
+        "mobileNumber": "9841615418",
+        "carType": "Hatchback",
+        "carBrand": "Maruti",
+        "carModel": "Breeza",
+        "yearOfManufacture": "2026",
+        "PolicyNumber": "78965412",
+        "policyExpiryDate": "2027-07-07"
+    }
+]

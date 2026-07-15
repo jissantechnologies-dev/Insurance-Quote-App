@@ -924,6 +924,19 @@ SEND_QUOTE_SCRIPT = r"""
                 })
                         .then(function (response) { return response.json(); })
                         .then(function (data) {
+                                if (!data.success && data.waLink) {
+                                        // Automation unavailable (e.g. hosted server): open a
+                                        // pre-filled WhatsApp chat instead; user presses Send.
+                                        window.open(data.waLink, "_blank", "noopener");
+                                        row.status = "Sent";
+                                        state.sentCount += 1;
+                                        showToast("success", row.name + ": WhatsApp opened - press Send in the new tab.");
+                                        return fetch("/api/send-quote/status", {
+                                                method: "POST",
+                                                headers: { "Content-Type": "application/json" },
+                                                body: JSON.stringify({ id: row.id, status: "Sent" })
+                                        }).catch(function () {});
+                                }
                                 row.status = data.status || "Failed";
                                 if (data.success) {
                                         state.sentCount += 1;
@@ -1066,11 +1079,13 @@ def build_send_quote_message(row):
 
 
 def send_whatsapp_quote(row):
-        """Send the quote via WhatsApp Web automation. Returns (ok, error_message)."""
+        """Send the quote via WhatsApp Web automation.
+
+        Returns (ok, error_message, automation_available)."""
         try:
                 import pywhatkit
         except Exception as exc:
-                return False, f"pywhatkit is not available: {exc}"
+                return False, f"Automated sending is not available on this server: {exc}", False
 
         try:
                 pywhatkit.sendwhatmsg_instantly(
@@ -1080,9 +1095,9 @@ def send_whatsapp_quote(row):
                         tab_close=True,
                         close_time=4,
                 )
-                return True, ""
+                return True, "", True
         except Exception as exc:
-                return False, str(exc)
+                return False, str(exc), True
 
 
 def find_send_quote_column(normalized_headers, aliases):
@@ -1504,6 +1519,104 @@ def build_dashboard_content(customers, xl_customers, new_customers, reminder_row
         )
 
 
+def perform_form_action(path, post_data):
+        return_to = sanitize_return_to(extract_post_value(post_data, "return_to"))
+
+        if path == "/add-customer":
+                new_customer = get_customer_from_post(post_data)
+                append_new_customer(new_customer)
+
+        if path == "/convert-customer":
+                try:
+                        index = int(extract_post_value(post_data, "index"))
+                except ValueError:
+                        index = -1
+                convert_new_customer_to_existing(index)
+
+        if path == "/delete-customer":
+                source = extract_post_value(post_data, "source")
+                try:
+                        index = int(extract_post_value(post_data, "index"))
+                except ValueError:
+                        index = -1
+                delete_customer_by_source(source, index)
+
+        if path == "/edit-customer":
+                source = extract_post_value(post_data, "source")
+                try:
+                        index = int(extract_post_value(post_data, "index"))
+                except ValueError:
+                        index = -1
+                updated_customer = get_customer_from_post(post_data)
+                update_customer_by_source(source, index, updated_customer)
+
+        return return_to
+
+
+def import_send_quote_file(filename, file_bytes):
+        """Parse an uploaded send-quote file and replace the current batch.
+
+        Returns (payload, http_status) ready for a JSON response."""
+        normalized_headers, raw_rows, error = parse_send_quote_upload(filename, file_bytes)
+        if error:
+                return {"success": False, "error": error}, 400
+
+        missing_columns = []
+        column_keys = {}
+        for field_key, display_name, aliases in SEND_QUOTE_COLUMNS:
+                found = find_send_quote_column(normalized_headers, aliases)
+                if found is None:
+                        missing_columns.append(display_name)
+                else:
+                        column_keys[field_key] = found
+
+        if missing_columns:
+                return {
+                        "success": False,
+                        "error": "Missing required column(s): " + ", ".join(missing_columns),
+                }, 400
+
+        rows = build_send_quote_rows(raw_rows, column_keys)
+        SEND_QUOTE_BATCH.clear()
+        SEND_QUOTE_BATCH.extend(rows)
+
+        invalid_count = sum(1 for row in rows if not row["valid"])
+        return {"success": True, "rows": rows, "total": len(rows), "invalidCount": invalid_count}, 200
+
+
+def set_send_quote_status(row_id, new_status):
+        """Returns (payload, http_status)."""
+        if new_status not in SEND_QUOTE_STATUSES:
+                return {"success": False, "error": "Invalid status."}, 400
+        for row in SEND_QUOTE_BATCH:
+                if row["id"] == row_id:
+                        row["status"] = new_status
+                        return {"success": True}, 200
+        return {"success": False, "error": "Row not found."}, 404
+
+
+def send_quote_for_row(row_id):
+        """Attempt automated send for one row. Returns (payload, http_status).
+
+        When automation is unavailable (e.g. hosted server with no browser),
+        the payload includes a wa.me fallback link the frontend can open."""
+        row = next((r for r in SEND_QUOTE_BATCH if r["id"] == row_id), None)
+        if row is None:
+                return {"success": False, "error": "Row not found."}, 404
+        if not row["valid"]:
+                row["status"] = "Failed"
+                return {"success": False, "status": "Failed", "error": "Row has validation issues."}, 200
+
+        ok, error, automation_available = send_whatsapp_quote(row)
+        row["status"] = "Sent" if ok else "Failed"
+        payload = {"success": ok, "status": row["status"], "error": error}
+        if not ok and not automation_available:
+                payload["waLink"] = build_whatsapp_link(
+                        row["mobileNumber"], build_send_quote_message(row)
+                )
+        return payload, 200
+
+
 class AppHandler(BaseHTTPRequestHandler):
         def send_json_response(self, status_code, payload):
                 body = json.dumps(payload).encode("utf-8")
@@ -1526,39 +1639,8 @@ class AppHandler(BaseHTTPRequestHandler):
 
                 filename = upload_item.get("filename", "")
                 file_bytes = upload_item.get("content", b"")
-                normalized_headers, raw_rows, error = parse_send_quote_upload(filename, file_bytes)
-                if error:
-                        self.send_json_response(400, {"success": False, "error": error})
-                        return
-
-                missing_columns = []
-                column_keys = {}
-                for field_key, display_name, aliases in SEND_QUOTE_COLUMNS:
-                        found = find_send_quote_column(normalized_headers, aliases)
-                        if found is None:
-                                missing_columns.append(display_name)
-                        else:
-                                column_keys[field_key] = found
-
-                if missing_columns:
-                        self.send_json_response(
-                                400,
-                                {
-                                        "success": False,
-                                        "error": "Missing required column(s): " + ", ".join(missing_columns),
-                                },
-                        )
-                        return
-
-                rows = build_send_quote_rows(raw_rows, column_keys)
-                SEND_QUOTE_BATCH.clear()
-                SEND_QUOTE_BATCH.extend(rows)
-
-                invalid_count = sum(1 for row in rows if not row["valid"])
-                self.send_json_response(
-                        200,
-                        {"success": True, "rows": rows, "total": len(rows), "invalidCount": invalid_count},
-                )
+                payload, status_code = import_send_quote_file(filename, file_bytes)
+                self.send_json_response(status_code, payload)
 
         def handle_send_quote_status(self):
                 content_length = int(self.headers.get("Content-Length", "0"))
@@ -1569,19 +1651,10 @@ class AppHandler(BaseHTTPRequestHandler):
                         self.send_json_response(400, {"success": False, "error": "Invalid request."})
                         return
 
-                row_id = payload.get("id")
-                new_status = str(payload.get("status", "")).strip()
-                if new_status not in SEND_QUOTE_STATUSES:
-                        self.send_json_response(400, {"success": False, "error": "Invalid status."})
-                        return
-
-                for row in SEND_QUOTE_BATCH:
-                        if row["id"] == row_id:
-                                row["status"] = new_status
-                                self.send_json_response(200, {"success": True})
-                                return
-
-                self.send_json_response(404, {"success": False, "error": "Row not found."})
+                response_payload, status_code = set_send_quote_status(
+                        payload.get("id"), str(payload.get("status", "")).strip()
+                )
+                self.send_json_response(status_code, response_payload)
 
         def handle_send_quote_send(self):
                 content_length = int(self.headers.get("Content-Length", "0"))
@@ -1592,19 +1665,8 @@ class AppHandler(BaseHTTPRequestHandler):
                         self.send_json_response(400, {"success": False, "error": "Invalid request."})
                         return
 
-                row_id = payload.get("id")
-                row = next((r for r in SEND_QUOTE_BATCH if r["id"] == row_id), None)
-                if row is None:
-                        self.send_json_response(404, {"success": False, "error": "Row not found."})
-                        return
-                if not row["valid"]:
-                        row["status"] = "Failed"
-                        self.send_json_response(200, {"success": False, "status": "Failed", "error": "Row has validation issues."})
-                        return
-
-                ok, error = send_whatsapp_quote(row)
-                row["status"] = "Sent" if ok else "Failed"
-                self.send_json_response(200, {"success": ok, "status": row["status"], "error": error})
+                response_payload, status_code = send_quote_for_row(payload.get("id"))
+                self.send_json_response(status_code, response_payload)
 
         def do_POST(self):
                 if self.path == "/api/send-quote/import":
@@ -1644,36 +1706,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         return
 
                 body = self.rfile.read(content_length).decode("utf-8", errors="ignore")
-                post_data = parse_qs(body)
-                return_to = sanitize_return_to(extract_post_value(post_data, "return_to"))
-
-                if self.path == "/add-customer":
-                        new_customer = get_customer_from_post(post_data)
-                        append_new_customer(new_customer)
-
-                if self.path == "/convert-customer":
-                        try:
-                                index = int(extract_post_value(post_data, "index"))
-                        except ValueError:
-                                index = -1
-                        convert_new_customer_to_existing(index)
-
-                if self.path == "/delete-customer":
-                        source = extract_post_value(post_data, "source")
-                        try:
-                                index = int(extract_post_value(post_data, "index"))
-                        except ValueError:
-                                index = -1
-                        delete_customer_by_source(source, index)
-
-                if self.path == "/edit-customer":
-                        source = extract_post_value(post_data, "source")
-                        try:
-                                index = int(extract_post_value(post_data, "index"))
-                        except ValueError:
-                                index = -1
-                        updated_customer = get_customer_from_post(post_data)
-                        update_customer_by_source(source, index, updated_customer)
+                return_to = perform_form_action(self.path, parse_qs(body))
 
                 self.send_response(303)
                 self.send_header("Location", return_to)
@@ -1698,149 +1731,154 @@ class AppHandler(BaseHTTPRequestHandler):
                         self.send_error(404, "Page not found")
                         return
 
-                query_params = parse_qs(parsed.query)
-                edit_source = extract_post_value(query_params, "edit_source")
-                try:
-                        edit_index = int(extract_post_value(query_params, "edit_index"))
-                except ValueError:
-                        edit_index = -1
-                edit_customer = get_edit_customer(edit_source, edit_index)
-                edit_card = build_edit_customer_card(edit_source, edit_index, edit_customer, current_path)
-
-                customers = load_customers()
-                xl_customers = load_new_customers_from_excel()
-                new_customers = load_new_customers()
-                today = date.today()
-
-                active_clients = customers + xl_customers
-                active_clients_with_source = []
-                active_clients_with_source.extend(
-                        (customer, "active_json", index)
-                        for index, customer in enumerate(customers)
-                )
-                active_clients_with_source.extend(
-                        (customer, "active_xl", index)
-                        for index, customer in enumerate(xl_customers)
-                )
-
-                car_type_filter = get_filter_value(query_params, "car_type")
-                car_brand_filter = get_filter_value(query_params, "car_brand")
-                car_model_filter = get_filter_value(query_params, "car_model")
-
-                filtered_active_clients_with_source = []
-                for customer, source, index in active_clients_with_source:
-                        car_type_value = str(get_customer_value(customer, "carType", "car")).strip().lower()
-                        car_brand_value = str(get_customer_value(customer, "carBrand")).strip().lower()
-                        car_model_value = str(get_customer_value(customer, "carModel")).strip().lower()
-
-                        if car_type_filter and car_type_value != car_type_filter:
-                                continue
-                        if car_brand_filter and car_brand_value != car_brand_filter:
-                                continue
-                        if car_model_filter and car_model_value != car_model_filter:
-                                continue
-                        filtered_active_clients_with_source.append((customer, source, index))
-
-                car_type_options = collect_filter_options(active_clients, "carType", "car")
-                car_brand_options = collect_filter_options(active_clients, "carBrand")
-                car_model_options = collect_filter_options(active_clients, "carModel")
-
-                active_filter_card = (
-                        '<div class="card">'
-                        '<h2>Filter Active Client</h2>'
-                        '<form class="filter-form" method="get" action="/active-clients">'
-                        '<label>Car Type'
-                        f'<select name="car_type">{build_filter_option_tags(car_type_options, car_type_filter)}</select>'
-                        '</label>'
-                        '<label>Car Brand'
-                        f'<select name="car_brand">{build_filter_option_tags(car_brand_options, car_brand_filter)}</select>'
-                        '</label>'
-                        '<label>Model'
-                        f'<select name="car_model">{build_filter_option_tags(car_model_options, car_model_filter)}</select>'
-                        '</label>'
-                        '<div class="filter-actions">'
-                        '<button class="save-customer-btn" type="submit">Apply Filter</button>'
-                        '<a class="menu-link" href="/active-clients">Clear</a>'
-                        '</div>'
-                        '</form>'
-                        '</div>'
-                )
-
-                customer_rows_list = []
-                customer_rows_list.extend(
-                        render_active_customer_row(customer, source, index, "/active-clients")
-                        for customer, source, index in filtered_active_clients_with_source
-                )
-                customer_rows = "".join(customer_rows_list)
-                if not customer_rows:
-                        customer_rows = '<tr><td colspan="10">No active clients available.</td></tr>'
-
-                new_customer_rows = "".join(
-                        render_new_customer_row(customer, index, "/leads")
-                        for index, customer in enumerate(new_customers)
-                )
-                if not new_customer_rows:
-                        new_customer_rows = '<tr><td colspan="10">No leads available.</td></tr>'
-
-                reminder_rows_list = render_expiry_alert_rows(customers, today)
-                reminder_rows_list.extend(render_expiry_alert_rows(xl_customers, today))
-                reminder_rows_list.sort(key=lambda item: item[0])
-
-                reminder_rows = "".join(item[1] for item in reminder_rows_list)
-                if not reminder_rows:
-                        reminder_rows = '<tr><td colspan="5">No policies expiring in next 30 days.</td></tr>'
-
-                dashboard_content = build_dashboard_content(customers, xl_customers, new_customers, reminder_rows_list, today)
-
-                leads_content = (
-                        build_add_customer_card("/leads")
-                        + edit_card
-                        + '<div class="card"><h2>Leads</h2><table>'
-                        '<thead><tr><th>Name</th><th>Age</th><th>Mobile Number</th><th>Car Type</th><th>Car Brand</th><th>Car Model</th><th>Year</th><th>Policy Number</th><th>Policy Expiry Date</th><th>Action</th></tr></thead>'
-                        f'<tbody>{new_customer_rows}</tbody>'
-                        '</table></div>'
-                )
-
-                active_content = (
-                        edit_card
-                        + active_filter_card
-                        + '<div class="card"><h2>Active Client</h2><div class="table-scroll"><table>'
-                        '<thead><tr><th>Name</th><th>Age</th><th>Mobile Number</th><th>Car Type</th><th>Car Brand</th><th>Car Model</th><th>Year</th><th>Policy Number</th><th>Policy Expiry Date</th><th>Action</th></tr></thead>'
-                        f'<tbody>{customer_rows}</tbody>'
-                        '</table></div></div>'
-                )
-
-                expiry_content = (
-                        '<div class="card"><h2>Expiry Alerts</h2><table>'
-                        '<thead><tr><th>Name</th><th>Policy Number</th><th>Expiry Date</th><th>Days Left</th><th>Action</th></tr></thead>'
-                        f'<tbody>{reminder_rows}</tbody>'
-                        '</table></div>'
-                )
-
-                page_content = dashboard_content
-                if current_path == "/leads":
-                        page_content = leads_content
-                if current_path == "/active-clients":
-                        page_content = active_content
-                if current_path == "/expiry-alerts":
-                        page_content = expiry_content
-                if current_path == "/send-quote":
-                        page_content = build_send_quote_content()
-
-                template = TEMPLATE_PATH.read_text(encoding="utf-8")
-                html = (
-                        template.replace("{{NAV_HOME_CLASS}}", build_nav_class(current_path, "/"))
-                        .replace("{{NAV_LEADS_CLASS}}", build_nav_class(current_path, "/leads"))
-                        .replace("{{NAV_ACTIVE_CLASS}}", build_nav_class(current_path, "/active-clients"))
-                        .replace("{{NAV_EXPIRY_CLASS}}", build_nav_class(current_path, "/expiry-alerts"))
-                        .replace("{{NAV_SENDQUOTE_CLASS}}", build_nav_class(current_path, "/send-quote"))
-                        .replace("{{PAGE_CONTENT}}", page_content)
-                )
+                html = render_page(current_path, parse_qs(parsed.query))
 
                 self.send_response(200)
                 self.send_header("Content-type", "text/html; charset=utf-8")
                 self.end_headers()
                 self.wfile.write(html.encode("utf-8"))
+
+
+def render_page(current_path, query_params):
+        edit_source = extract_post_value(query_params, "edit_source")
+        try:
+                edit_index = int(extract_post_value(query_params, "edit_index"))
+        except ValueError:
+                edit_index = -1
+        edit_customer = get_edit_customer(edit_source, edit_index)
+        edit_card = build_edit_customer_card(edit_source, edit_index, edit_customer, current_path)
+
+        customers = load_customers()
+        xl_customers = load_new_customers_from_excel()
+        new_customers = load_new_customers()
+        today = date.today()
+
+        active_clients = customers + xl_customers
+        active_clients_with_source = []
+        active_clients_with_source.extend(
+                (customer, "active_json", index)
+                for index, customer in enumerate(customers)
+        )
+        active_clients_with_source.extend(
+                (customer, "active_xl", index)
+                for index, customer in enumerate(xl_customers)
+        )
+
+        car_type_filter = get_filter_value(query_params, "car_type")
+        car_brand_filter = get_filter_value(query_params, "car_brand")
+        car_model_filter = get_filter_value(query_params, "car_model")
+
+        filtered_active_clients_with_source = []
+        for customer, source, index in active_clients_with_source:
+                car_type_value = str(get_customer_value(customer, "carType", "car")).strip().lower()
+                car_brand_value = str(get_customer_value(customer, "carBrand")).strip().lower()
+                car_model_value = str(get_customer_value(customer, "carModel")).strip().lower()
+
+                if car_type_filter and car_type_value != car_type_filter:
+                        continue
+                if car_brand_filter and car_brand_value != car_brand_filter:
+                        continue
+                if car_model_filter and car_model_value != car_model_filter:
+                        continue
+                filtered_active_clients_with_source.append((customer, source, index))
+
+        car_type_options = collect_filter_options(active_clients, "carType", "car")
+        car_brand_options = collect_filter_options(active_clients, "carBrand")
+        car_model_options = collect_filter_options(active_clients, "carModel")
+
+        active_filter_card = (
+                '<div class="card">'
+                '<h2>Filter Active Client</h2>'
+                '<form class="filter-form" method="get" action="/active-clients">'
+                '<label>Car Type'
+                f'<select name="car_type">{build_filter_option_tags(car_type_options, car_type_filter)}</select>'
+                '</label>'
+                '<label>Car Brand'
+                f'<select name="car_brand">{build_filter_option_tags(car_brand_options, car_brand_filter)}</select>'
+                '</label>'
+                '<label>Model'
+                f'<select name="car_model">{build_filter_option_tags(car_model_options, car_model_filter)}</select>'
+                '</label>'
+                '<div class="filter-actions">'
+                '<button class="save-customer-btn" type="submit">Apply Filter</button>'
+                '<a class="menu-link" href="/active-clients">Clear</a>'
+                '</div>'
+                '</form>'
+                '</div>'
+        )
+
+        customer_rows_list = []
+        customer_rows_list.extend(
+                render_active_customer_row(customer, source, index, "/active-clients")
+                for customer, source, index in filtered_active_clients_with_source
+        )
+        customer_rows = "".join(customer_rows_list)
+        if not customer_rows:
+                customer_rows = '<tr><td colspan="10">No active clients available.</td></tr>'
+
+        new_customer_rows = "".join(
+                render_new_customer_row(customer, index, "/leads")
+                for index, customer in enumerate(new_customers)
+        )
+        if not new_customer_rows:
+                new_customer_rows = '<tr><td colspan="10">No leads available.</td></tr>'
+
+        reminder_rows_list = render_expiry_alert_rows(customers, today)
+        reminder_rows_list.extend(render_expiry_alert_rows(xl_customers, today))
+        reminder_rows_list.sort(key=lambda item: item[0])
+
+        reminder_rows = "".join(item[1] for item in reminder_rows_list)
+        if not reminder_rows:
+                reminder_rows = '<tr><td colspan="5">No policies expiring in next 30 days.</td></tr>'
+
+        dashboard_content = build_dashboard_content(customers, xl_customers, new_customers, reminder_rows_list, today)
+
+        leads_content = (
+                build_add_customer_card("/leads")
+                + edit_card
+                + '<div class="card"><h2>Leads</h2><table>'
+                '<thead><tr><th>Name</th><th>Age</th><th>Mobile Number</th><th>Car Type</th><th>Car Brand</th><th>Car Model</th><th>Year</th><th>Policy Number</th><th>Policy Expiry Date</th><th>Action</th></tr></thead>'
+                f'<tbody>{new_customer_rows}</tbody>'
+                '</table></div>'
+        )
+
+        active_content = (
+                edit_card
+                + active_filter_card
+                + '<div class="card"><h2>Active Client</h2><div class="table-scroll"><table>'
+                '<thead><tr><th>Name</th><th>Age</th><th>Mobile Number</th><th>Car Type</th><th>Car Brand</th><th>Car Model</th><th>Year</th><th>Policy Number</th><th>Policy Expiry Date</th><th>Action</th></tr></thead>'
+                f'<tbody>{customer_rows}</tbody>'
+                '</table></div></div>'
+        )
+
+        expiry_content = (
+                '<div class="card"><h2>Expiry Alerts</h2><table>'
+                '<thead><tr><th>Name</th><th>Policy Number</th><th>Expiry Date</th><th>Days Left</th><th>Action</th></tr></thead>'
+                f'<tbody>{reminder_rows}</tbody>'
+                '</table></div>'
+        )
+
+        page_content = dashboard_content
+        if current_path == "/leads":
+                page_content = leads_content
+        if current_path == "/active-clients":
+                page_content = active_content
+        if current_path == "/expiry-alerts":
+                page_content = expiry_content
+        if current_path == "/send-quote":
+                page_content = build_send_quote_content()
+
+        template = TEMPLATE_PATH.read_text(encoding="utf-8")
+        html = (
+                template.replace("{{NAV_HOME_CLASS}}", build_nav_class(current_path, "/"))
+                .replace("{{NAV_LEADS_CLASS}}", build_nav_class(current_path, "/leads"))
+                .replace("{{NAV_ACTIVE_CLASS}}", build_nav_class(current_path, "/active-clients"))
+                .replace("{{NAV_EXPIRY_CLASS}}", build_nav_class(current_path, "/expiry-alerts"))
+                .replace("{{NAV_SENDQUOTE_CLASS}}", build_nav_class(current_path, "/send-quote"))
+                .replace("{{PAGE_CONTENT}}", page_content)
+        )
+
+        return html
 
 
 if __name__ == "__main__":

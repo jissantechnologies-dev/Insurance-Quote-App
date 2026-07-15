@@ -35,6 +35,10 @@ SEND_QUOTE_STATUSES = ("Pending", "Sent", "Failed", "Delivered", "Read")
 SEND_QUOTE_BATCH = []
 SEND_QUOTE_NEXT_ID = [1]
 
+# WhatsApp account used to send quotes. Log in to WhatsApp Web on this PC
+# with the phone that owns this number (scan the QR code once).
+DEFAULT_WHATSAPP_SENDER = "9025325123"
+
 
 def get_new_customers_excel_path():
         if NEW_CUSTOMERS_EXCEL_PATH.exists():
@@ -607,6 +611,7 @@ def build_send_quote_content():
                 '</label>'
                 '<span id="sendQuoteImportStatus" class="import-status"></span>'
                 '</div>'
+                f'<p class="sender-note">Messages are sent automatically via WhatsApp Web using the default number <strong>{escape(DEFAULT_WHATSAPP_SENDER)}</strong>. Keep WhatsApp Web logged in with that number on this PC.</p>'
                 '<div id="sendQuoteImportError" class="form-error is-hidden"></div>'
                 '</div>'
                 '<div class="card">'
@@ -724,20 +729,6 @@ SEND_QUOTE_SCRIPT = r"""
 
         function statusClass(status) {
                 return "status-badge status-" + String(status || "pending").toLowerCase();
-        }
-
-        function buildMessage(row) {
-                return "Hello " + row.name + ",\n\n" +
-                        "Your motor insurance for vehicle " + row.vehicleNumber + " is due to expire on " + row.expiryDate + ".\n\n" +
-                        "Your renewal quote is ready.\n\n" +
-                        "Please click the link below to view your quote and renew your policy:\n" +
-                        row.quoteLink + "\n\n" +
-                        "If you have any questions, feel free to contact us.\n\n" +
-                        "Thank you,\nGravity Insurance";
-        }
-
-        function buildWhatsAppLink(row) {
-                return "https://wa.me/" + row.mobileNumber + "?text=" + encodeURIComponent(buildMessage(row));
         }
 
         function getFilteredRows() {
@@ -908,16 +899,6 @@ SEND_QUOTE_SCRIPT = r"""
                 confirmSendModal.classList.add("is-hidden");
         });
 
-        function updateRowStatus(id, status) {
-                var row = state.rows.find(function (r) { return r.id === id; });
-                if (row) row.status = status;
-                return fetch("/api/send-quote/status", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ id: id, status: status })
-                });
-        }
-
         function renderQueueStep() {
                 var total = state.queue.length;
                 var processed = state.sentCount + state.failedCount;
@@ -932,29 +913,34 @@ SEND_QUOTE_SCRIPT = r"""
                 }
 
                 var row = state.queue[state.queueIndex];
-                var waLink = buildWhatsAppLink(row);
                 sendQueueCurrent.innerHTML =
-                        "<p><strong>" + escapeHtml(row.name) + "</strong> &middot; " + escapeHtml(row.mobileNumber) + "</p>" +
-                        '<a id="openWaLink" class="wa-link" href="' + escapeHtml(waLink) + '" target="_blank" rel="noopener noreferrer">Open WhatsApp</a>' +
-                        '<div class="modal-actions">' +
-                        '<button id="markSentBtn" class="save-customer-btn" type="button">Mark as Sent</button>' +
-                        '<button id="markFailedBtn" class="delete-btn" type="button">Mark as Failed</button>' +
-                        "</div>";
+                        "<p><strong>Sending to " + escapeHtml(row.name) + "</strong> &middot; " + escapeHtml(row.mobileNumber) + "...</p>" +
+                        "<p>WhatsApp Web will open and send the message automatically. Please don't touch the keyboard or mouse.</p>";
 
-                document.getElementById("markSentBtn").addEventListener("click", function () {
-                        updateRowStatus(row.id, "Sent").finally(function () {
-                                state.sentCount += 1;
-                                state.queueIndex += 1;
-                                renderQueueStep();
-                        });
-                });
-                document.getElementById("markFailedBtn").addEventListener("click", function () {
-                        updateRowStatus(row.id, "Failed").finally(function () {
+                fetch("/api/send-quote/send", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ id: row.id })
+                })
+                        .then(function (response) { return response.json(); })
+                        .then(function (data) {
+                                row.status = data.status || "Failed";
+                                if (data.success) {
+                                        state.sentCount += 1;
+                                } else {
+                                        state.failedCount += 1;
+                                        if (data.error) showToast("error", row.name + ": " + data.error);
+                                }
+                        })
+                        .catch(function () {
+                                row.status = "Failed";
                                 state.failedCount += 1;
+                        })
+                        .finally(function () {
                                 state.queueIndex += 1;
+                                render();
                                 renderQueueStep();
                         });
-                });
         }
 
         confirmSendBtn.addEventListener("click", function () {
@@ -1065,6 +1051,38 @@ def parse_send_quote_expiry(text):
 def is_valid_quote_link(text):
         raw = str(text or "").strip()
         return raw.startswith("http://") or raw.startswith("https://")
+
+
+def build_send_quote_message(row):
+        return (
+                f"Hello {row['name']},\n\n"
+                f"Your motor insurance for vehicle {row['vehicleNumber']} is due to expire on {row['expiryDate']}.\n\n"
+                "Your renewal quote is ready.\n\n"
+                "Please click the link below to view your quote and renew your policy:\n"
+                f"{row['quoteLink']}\n\n"
+                "If you have any questions, feel free to contact us.\n\n"
+                "Thank you,\nGravity Insurance"
+        )
+
+
+def send_whatsapp_quote(row):
+        """Send the quote via WhatsApp Web automation. Returns (ok, error_message)."""
+        try:
+                import pywhatkit
+        except Exception as exc:
+                return False, f"pywhatkit is not available: {exc}"
+
+        try:
+                pywhatkit.sendwhatmsg_instantly(
+                        phone_no="+" + row["mobileNumber"],
+                        message=build_send_quote_message(row),
+                        wait_time=25,
+                        tab_close=True,
+                        close_time=4,
+                )
+                return True, ""
+        except Exception as exc:
+                return False, str(exc)
 
 
 def find_send_quote_column(normalized_headers, aliases):
@@ -1565,12 +1583,38 @@ class AppHandler(BaseHTTPRequestHandler):
 
                 self.send_json_response(404, {"success": False, "error": "Row not found."})
 
+        def handle_send_quote_send(self):
+                content_length = int(self.headers.get("Content-Length", "0"))
+                body_bytes = self.rfile.read(content_length)
+                try:
+                        payload = json.loads(body_bytes.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                        self.send_json_response(400, {"success": False, "error": "Invalid request."})
+                        return
+
+                row_id = payload.get("id")
+                row = next((r for r in SEND_QUOTE_BATCH if r["id"] == row_id), None)
+                if row is None:
+                        self.send_json_response(404, {"success": False, "error": "Row not found."})
+                        return
+                if not row["valid"]:
+                        row["status"] = "Failed"
+                        self.send_json_response(200, {"success": False, "status": "Failed", "error": "Row has validation issues."})
+                        return
+
+                ok, error = send_whatsapp_quote(row)
+                row["status"] = "Sent" if ok else "Failed"
+                self.send_json_response(200, {"success": ok, "status": row["status"], "error": error})
+
         def do_POST(self):
                 if self.path == "/api/send-quote/import":
                         self.handle_send_quote_import()
                         return
                 if self.path == "/api/send-quote/status":
                         self.handle_send_quote_status()
+                        return
+                if self.path == "/api/send-quote/send":
+                        self.handle_send_quote_send()
                         return
 
                 if self.path not in ("/add-customer", "/convert-customer", "/delete-customer", "/edit-customer", "/bulk-upload-customers"):

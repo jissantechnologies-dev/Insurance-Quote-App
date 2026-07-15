@@ -764,3 +764,10 @@ pre {
         height: 200px;
     }
 }
+
+.sender-note {
+    margin-top: 10px;
+    font-size: 0.9rem;
+    color: #5b5b7a;
+}
+

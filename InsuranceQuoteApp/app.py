@@ -8,11 +8,24 @@ All page rendering and data logic lives in main.py and is shared with the
 local development server (py main.py).
 """
 
+import traceback
+
 from flask import Flask, Response, jsonify, redirect, request
 
 import main as core
 
 app = Flask(__name__)
+
+
+# TEMPORARY: show the real traceback in the browser to debug the 500 errors.
+# Remove this handler once the issue is resolved.
+@app.errorhandler(Exception)
+def show_error(exc):
+        return Response(
+                "APP ERROR:\n\n" + traceback.format_exc(),
+                status=500,
+                mimetype="text/plain",
+        )
 
 
 def query_params():

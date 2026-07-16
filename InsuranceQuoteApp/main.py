@@ -17,7 +17,7 @@ except ImportError:
 
 
 BASE_DIR = Path(__file__).resolve().parent
-TEMPLATE_PATH = BASE_DIR / "index.html"
+TEMPLATE_PATH = BASE_DIR / "template.html"
 STYLE_PATH = BASE_DIR / "style.css"
 CUSTOMERS_JSON_PATH = BASE_DIR / "customers.json"
 NEW_CUSTOMERS_TEXT_PATH = BASE_DIR / "newcustomer.txt"

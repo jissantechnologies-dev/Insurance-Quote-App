@@ -736,22 +736,15 @@ pre {
         padding: 22px 18px;
     }
 
-    .card {
-        overflow-x: auto;
-    }
-
-    table {
-        min-width: 860px;
-    }
-
-    .add-customer-form {
-        min-width: 400px;
-    }
-
     .top-menu {
         overflow-x: auto;
         padding-bottom: 4px;
         flex-wrap: nowrap;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .menu-link {
+        white-space: nowrap;
     }
 
     .revenue-chart {
@@ -762,6 +755,108 @@ pre {
 
     .revenue-item {
         height: 200px;
+    }
+}
+
+/* Phones: stack table rows into labelled cards, single-column forms */
+@media (max-width: 700px) {
+    .add-customer-form,
+    .filter-form,
+    .bulk-upload-form {
+        grid-template-columns: 1fr;
+    }
+
+    .search-fields {
+        width: 100%;
+    }
+
+    .search-fields input {
+        flex: 1 1 100%;
+        min-width: 0;
+    }
+
+    .send-quote-controls,
+    .send-quote-toolbar,
+    .selection-bar {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .table-scroll {
+        max-height: none;
+        overflow-y: visible;
+    }
+
+    table.stacked,
+    table.stacked tbody,
+    table.stacked tr,
+    table.stacked td {
+        display: block;
+        width: 100%;
+    }
+
+    table.stacked thead {
+        display: none;
+    }
+
+    table.stacked {
+        border-radius: 0;
+    }
+
+    table.stacked tbody tr {
+        margin-bottom: 12px;
+        padding: 10px 12px;
+        border: 1px solid var(--card-border);
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.92);
+        box-shadow: 0 8px 18px rgba(68, 44, 138, 0.08);
+    }
+
+    table.stacked tbody tr:nth-child(even) {
+        background: rgba(255, 255, 255, 0.92);
+    }
+
+    table.stacked td {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+        padding: 6px 0;
+        border-bottom: 1px dashed rgba(101, 87, 169, 0.14);
+        text-align: right;
+        overflow-wrap: anywhere;
+    }
+
+    table.stacked td:last-child {
+        border-bottom: 0;
+    }
+
+    table.stacked td::before {
+        content: attr(data-label);
+        flex-shrink: 0;
+        font-weight: 700;
+        font-size: 0.8rem;
+        color: var(--muted);
+        text-align: left;
+    }
+
+    table.stacked td:empty {
+        display: none;
+    }
+
+    table.stacked td[data-label=""]::before {
+        content: none;
+    }
+
+    .row-actions,
+    .action-links {
+        justify-content: flex-end;
+    }
+
+    .toast-container {
+        left: 12px;
+        right: 12px;
+        bottom: 12px;
     }
 }
 

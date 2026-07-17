@@ -34,6 +34,34 @@
                 form.classList.toggle("is-hidden");
             });
         }
+
+        // Mobile layout: copy each column header onto its cells so CSS can
+        // stack rows into labelled cards on small screens.
+        function applyStackedLabels(table) {
+            const headers = Array.from(table.querySelectorAll("thead th")).map(function (th) {
+                return (th.textContent || th.getAttribute("aria-label") || "").trim();
+            });
+            if (!headers.length) {
+                return;
+            }
+            table.classList.add("stacked");
+            table.querySelectorAll("tbody tr").forEach(function (row) {
+                row.querySelectorAll("td").forEach(function (cell, index) {
+                    const label = cell.hasAttribute("colspan") ? "" : (headers[index] || "");
+                    cell.setAttribute("data-label", label);
+                });
+            });
+        }
+
+        document.querySelectorAll("table").forEach(function (table) {
+            applyStackedLabels(table);
+            const body = table.querySelector("tbody");
+            if (body) {
+                new MutationObserver(function () {
+                    applyStackedLabels(table);
+                }).observe(body, { childList: true });
+            }
+        });
     </script>
 </body>
 </html>

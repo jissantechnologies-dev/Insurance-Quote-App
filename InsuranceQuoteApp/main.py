@@ -6,7 +6,7 @@ from datetime import date, datetime
 from email.parser import BytesParser
 from email.policy import default
 from html import escape
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote_plus, urlparse
 
@@ -1884,4 +1884,4 @@ def render_page(current_path, query_params):
 if __name__ == "__main__":
         host, port = "127.0.0.1", 8000
         print(f"Server running at http://{host}:{port}")
-        HTTPServer((host, port), AppHandler).serve_forever()
+        ThreadingHTTPServer((host, port), AppHandler).serve_forever()

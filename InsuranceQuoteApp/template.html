@@ -13,7 +13,10 @@
         <h1>Gravity Insurance</h1>
         <p class="subheading">Customer quote pages</p>
     </header>
-    <nav class="top-menu">
+    <button type="button" class="menu-toggle" id="menuToggle" aria-expanded="false" aria-controls="topMenu">
+        <span class="menu-toggle-icon">&#9776;</span> Menu
+    </button>
+    <nav class="top-menu" id="topMenu">
         <a class="{{NAV_HOME_CLASS}}" href="/">Home</a>
         <a class="{{NAV_LEADS_CLASS}}" href="/leads">Leads</a>
         <a class="{{NAV_ACTIVE_CLASS}}" href="/active-clients">Active Client</a>
@@ -32,6 +35,17 @@
         if (toggleButton && form) {
             toggleButton.addEventListener("click", function () {
                 form.classList.toggle("is-hidden");
+            });
+        }
+
+        // Mobile nav: toggle the menu list open/closed.
+        const menuToggle = document.getElementById("menuToggle");
+        const topMenu = document.getElementById("topMenu");
+
+        if (menuToggle && topMenu) {
+            menuToggle.addEventListener("click", function () {
+                const isOpen = topMenu.classList.toggle("is-open");
+                menuToggle.setAttribute("aria-expanded", isOpen ? "true" : "false");
             });
         }
 

@@ -35,10 +35,6 @@ SEND_QUOTE_STATUSES = ("Pending", "Sent", "Failed", "Delivered", "Read")
 SEND_QUOTE_BATCH = []
 SEND_QUOTE_NEXT_ID = [1]
 
-# WhatsApp account used to send quotes. Log in to WhatsApp Web on this PC
-# with the phone that owns this number (scan the QR code once).
-DEFAULT_WHATSAPP_SENDER = "9025325123"
-
 
 def get_new_customers_excel_path():
         if NEW_CUSTOMERS_EXCEL_PATH.exists():
@@ -611,7 +607,7 @@ def build_send_quote_content():
                 '</label>'
                 '<span id="sendQuoteImportStatus" class="import-status"></span>'
                 '</div>'
-                f'<p class="sender-note">Messages are sent automatically via WhatsApp Web using the default number <strong>{escape(DEFAULT_WHATSAPP_SENDER)}</strong>. Keep WhatsApp Web logged in with that number on this PC.</p>'
+                '<p class="sender-note">Messages are sent from the WhatsApp account logged in on this device. Make sure you are logged in to WhatsApp (or WhatsApp Web) with the business number before sending.</p>'
                 '<div id="sendQuoteImportError" class="form-error is-hidden"></div>'
                 '</div>'
                 '<div class="card">'

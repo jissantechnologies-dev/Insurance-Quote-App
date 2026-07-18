@@ -105,6 +105,27 @@ h1 {
     padding: 8px 14px;
 }
 
+.menu-toggle {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+    padding: 10px 16px;
+    border: 1px solid var(--card-border);
+    border-radius: 999px;
+    background: linear-gradient(135deg, #3d7bf2, #1fb6ff);
+    color: #fff;
+    font-weight: 700;
+    font-size: 0.95rem;
+    cursor: pointer;
+    box-shadow: 0 10px 20px rgba(31, 182, 255, 0.25);
+}
+
+.menu-toggle-icon {
+    font-size: 1.1rem;
+    line-height: 1;
+}
+
 .menu-link.active {
     color: #fff;
     background: linear-gradient(135deg, #3d7bf2, #1fb6ff);
@@ -736,15 +757,28 @@ pre {
         padding: 22px 18px;
     }
 
+    .menu-toggle {
+        display: inline-flex;
+    }
+
     .top-menu {
-        overflow-x: auto;
-        padding-bottom: 4px;
-        flex-wrap: nowrap;
-        -webkit-overflow-scrolling: touch;
+        display: none;
+        flex-direction: column;
+        gap: 8px;
+        padding: 12px;
+        border: 1px solid var(--card-border);
+        border-radius: 16px;
+        background: var(--card-bg);
+        box-shadow: var(--shadow);
+    }
+
+    .top-menu.is-open {
+        display: flex;
     }
 
     .menu-link {
-        white-space: nowrap;
+        display: block;
+        text-align: center;
     }
 
     .revenue-chart {

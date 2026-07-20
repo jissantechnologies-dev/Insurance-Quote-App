@@ -13,3 +13,15 @@ __pycache__/
 
 # Excel lock files
 ~$*.xlsx
+
+# pywhatkit's local send-history cache - only relevant to browser automation
+# on your own machine; the hosted server never uses pywhatkit (no browser).
+PyWhatKit_DB.txt
+
+# Sent History and pending import batch for the Send Quote / Send Payment
+# Link pages - live data written by the running server, same reasoning as
+# users.json above.
+InsuranceQuoteApp/sent_quote.json
+InsuranceQuoteApp/sent_payment.json
+InsuranceQuoteApp/batch_quote.json
+InsuranceQuoteApp/batch_payment.json

@@ -162,6 +162,13 @@ def send_link_rows():
         return jsonify({"rows": core.SEND_LINK_BATCHES[kind]})
 
 
+@app.get("/api/send-quote/sent-rows")
+@app.get("/api/send-payment-link/sent-rows")
+def send_link_sent_rows():
+        kind, _ = core.get_send_link_api_action(request.path)
+        return jsonify({"rows": core.SEND_LINK_SENT[kind]})
+
+
 @app.post("/api/send-quote/import")
 @app.post("/api/send-payment-link/import")
 def send_link_import():

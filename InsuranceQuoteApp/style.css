@@ -961,3 +961,9 @@ pre {
     background: #ffe3e3;
     color: #a4262c;
 }
+
+/* ---------- Sent table (Send Quote / Send Payment Link pages) ---------- */
+
+#sendQuoteSentTable tbody tr {
+    opacity: 0.9;
+}

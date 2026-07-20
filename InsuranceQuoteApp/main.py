@@ -3,6 +3,7 @@ import json
 from io import BytesIO
 from collections import Counter
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from email.parser import BytesParser
 from email.policy import default
 from html import escape
@@ -23,6 +24,11 @@ CUSTOMERS_JSON_PATH = BASE_DIR / "customers.json"
 NEW_CUSTOMERS_TEXT_PATH = BASE_DIR / "newcustomer.txt"
 NEW_CUSTOMERS_EXCEL_PATH = BASE_DIR / "newcustomer.xlsx"
 ALLOWED_PAGE_PATHS = {"/", "/leads", "/active-clients", "/expiry-alerts", "/send-quote", "/send-payment-link"}
+
+# The hosted server's system clock may not be set to India time, so sent
+# timestamps are always computed in IST explicitly rather than relying on
+# datetime.now() (which follows whatever timezone the host happens to use).
+IST = ZoneInfo("Asia/Kolkata")
 
 import auth
 
@@ -61,8 +67,54 @@ SEND_LINK_KINDS = {
                 "message_intro": "Please use the link below to complete your payment.",
         },
 }
-SEND_LINK_BATCHES = {kind: [] for kind in SEND_LINK_KINDS}
-SEND_LINK_NEXT_ID = {kind: [1] for kind in SEND_LINK_KINDS}
+SEND_LINK_SENT_PATHS = {kind: BASE_DIR / f"sent_{kind}.json" for kind in SEND_LINK_KINDS}
+SEND_LINK_BATCH_PATHS = {kind: BASE_DIR / f"batch_{kind}.json" for kind in SEND_LINK_KINDS}
+
+
+def load_json_list(path):
+        if not path.exists():
+                return []
+        try:
+                with path.open("r", encoding="utf-8") as file:
+                        return json.load(file)
+        except (ValueError, OSError):
+                return []
+
+
+def save_sent_history(kind):
+        with SEND_LINK_SENT_PATHS[kind].open("w", encoding="utf-8") as file:
+                json.dump(SEND_LINK_SENT[kind], file, indent=4)
+
+
+def save_pending_batch(kind):
+        with SEND_LINK_BATCH_PATHS[kind].open("w", encoding="utf-8") as file:
+                json.dump(SEND_LINK_BATCHES[kind], file, indent=4)
+
+
+SEND_LINK_BATCHES = {kind: load_json_list(SEND_LINK_BATCH_PATHS[kind]) for kind in SEND_LINK_KINDS}
+SEND_LINK_SENT = {kind: load_json_list(SEND_LINK_SENT_PATHS[kind]) for kind in SEND_LINK_KINDS}
+SEND_LINK_NEXT_ID = {
+        kind: [max([row["id"] for row in SEND_LINK_BATCHES[kind] + SEND_LINK_SENT[kind]], default=0) + 1]
+        for kind in SEND_LINK_KINDS
+}
+
+
+def remove_row_from_batch(kind, row_id):
+        batch = SEND_LINK_BATCHES[kind]
+        for index, row in enumerate(batch):
+                if row["id"] == row_id:
+                        del batch[index]
+                        save_pending_batch(kind)
+                        return row
+        return None
+
+
+def move_row_to_sent(kind, row):
+        row["status"] = "Sent"
+        row["sentAt"] = datetime.now(IST).strftime("%Y-%m-%d %I:%M %p")
+        SEND_LINK_SENT[kind].insert(0, row)
+        save_sent_history(kind)
+        return row
 
 
 def get_send_link_columns(kind):
@@ -555,7 +607,6 @@ def render_active_customer_row(customer, source, index, return_to):
         action_html = render_row_actions(source, index, return_to)
         return (
                 f"<tr><td>{escape(str(get_customer_value(customer, 'name')))}</td>"
-                f"<td>{escape(str(get_customer_value(customer, 'age')))}</td>"
                 f"<td>{escape(str(get_customer_value(customer, 'mobileNumber', 'phoneNumber', 'phone')))}</td>"
                 f"<td>{escape(str(get_customer_value(customer, 'carType', 'car')))}</td>"
                 f"<td>{escape(str(get_customer_value(customer, 'carBrand')))}</td>"
@@ -571,7 +622,6 @@ def render_new_customer_row(customer, index, return_to):
         action_html = render_row_actions("lead", index, return_to, include_convert=True)
         return (
                 f"<tr><td>{escape(str(get_customer_value(customer, 'name')))}</td>"
-                f"<td>{escape(str(get_customer_value(customer, 'age')))}</td>"
                 f"<td>{escape(str(get_customer_value(customer, 'mobileNumber', 'phoneNumber', 'phone')))}</td>"
                 f"<td>{escape(str(get_customer_value(customer, 'carType', 'car')))}</td>"
                 f"<td>{escape(str(get_customer_value(customer, 'carBrand')))}</td>"
@@ -691,6 +741,23 @@ def build_send_quote_content(kind="quote"):
                 '<button id="nextPageBtn" class="edit-btn" type="button">Next &raquo;</button>'
                 '</div>'
                 '</div>'
+                '<div class="card">'
+                '<h2>Sent History</h2>'
+                '<div class="table-scroll">'
+                '<table id="sendQuoteSentTable">'
+                '<thead><tr>'
+                '<th>Name</th>'
+                '<th>Mobile Number</th>'
+                '<th>Vehicle Number</th>'
+                '<th>Expiry Date</th>'
+                f'<th>{escape(config["link_header"])}</th>'
+                '<th>Status</th>'
+                '<th>Sent Date/Time</th>'
+                '</tr></thead>'
+                '<tbody id="sendQuoteSentTableBody"><tr><td colspan="7">No messages sent yet.</td></tr></tbody>'
+                '</table>'
+                '</div>'
+                '</div>'
                 '<div id="confirmSendModal" class="modal-overlay is-hidden">'
                 '<div class="modal-box">'
                 '<h3 id="confirmSendText">Send WhatsApp messages?</h3>'
@@ -720,6 +787,7 @@ SEND_QUOTE_SCRIPT = r"""
 (function () {
         var state = {
                 rows: [],
+                sentRows: [],
                 selectedIds: new Set(),
                 page: 1,
                 pageSize: 10,
@@ -732,6 +800,7 @@ SEND_QUOTE_SCRIPT = r"""
         };
 
         var tableBody = document.getElementById("sendQuoteTableBody");
+        var sentTableBody = document.getElementById("sendQuoteSentTableBody");
         var selectAllCheckbox = document.getElementById("selectAllCheckbox");
         var selectionCount = document.getElementById("selectionCount");
         var sendQuoteBtn = document.getElementById("sendQuoteBtn");
@@ -845,6 +914,33 @@ SEND_QUOTE_SCRIPT = r"""
                 updateSelectionCount();
         }
 
+        function renderSent() {
+                if (!state.sentRows.length) {
+                        sentTableBody.innerHTML = '<tr><td colspan="7">No messages sent yet.</td></tr>';
+                        return;
+                }
+                sentTableBody.innerHTML = state.sentRows.map(function (row) {
+                        return "<tr>" +
+                                "<td>" + escapeHtml(row.name) + "</td>" +
+                                "<td>" + escapeHtml(row.mobileNumber) + "</td>" +
+                                "<td>" + escapeHtml(row.vehicleNumber) + "</td>" +
+                                "<td>" + escapeHtml(row.expiryDate) + "</td>" +
+                                '<td><a href="' + escapeHtml(row.quoteLink) + '" target="_blank" rel="noopener noreferrer">__VIEW_LABEL__</a></td>' +
+                                '<td><span class="' + statusClass(row.status) + '">' + escapeHtml(row.status) + "</span></td>" +
+                                "<td>" + escapeHtml(row.sentAt || "") + "</td>" +
+                                "</tr>";
+                }).join("");
+        }
+
+        function moveRowToSent(row, sentAt) {
+                var index = state.rows.findIndex(function (r) { return r.id === row.id; });
+                if (index !== -1) state.rows.splice(index, 1);
+                row.status = "Sent";
+                row.sentAt = sentAt || "";
+                state.sentRows.unshift(row);
+                state.selectedIds.delete(row.id);
+        }
+
         tableBody.addEventListener("change", function (event) {
                 if (!event.target.classList.contains("row-checkbox")) return;
                 var id = Number(event.target.getAttribute("data-id"));
@@ -954,6 +1050,7 @@ SEND_QUOTE_SCRIPT = r"""
                         sendQueueCurrent.innerHTML = "<p><strong>All done.</strong> " + state.sentCount + " sent, " + state.failedCount + " failed.</p>";
                         showToast("success", state.sentCount + " quote(s) sent, " + state.failedCount + " failed.");
                         render();
+                        renderSent();
                         return;
                 }
 
@@ -973,19 +1070,26 @@ SEND_QUOTE_SCRIPT = r"""
                                         // Automation unavailable (e.g. hosted server): open a
                                         // pre-filled WhatsApp chat instead; user presses Send.
                                         window.open(data.waLink, "_blank", "noopener");
-                                        row.status = "Sent";
                                         state.sentCount += 1;
                                         showToast("success", row.name + ": WhatsApp opened - press Send in the new tab.");
                                         return fetch("__API_PREFIX__/status", {
                                                 method: "POST",
                                                 headers: { "Content-Type": "application/json" },
                                                 body: JSON.stringify({ id: row.id, status: "Sent" })
-                                        }).catch(function () {});
+                                        })
+                                                .then(function (response) { return response.json(); })
+                                                .then(function (statusData) {
+                                                        moveRowToSent(row, statusData.sentAt);
+                                                })
+                                                .catch(function () {
+                                                        moveRowToSent(row, "");
+                                                });
                                 }
-                                row.status = data.status || "Failed";
                                 if (data.success) {
                                         state.sentCount += 1;
+                                        moveRowToSent(row, data.sentAt);
                                 } else {
+                                        row.status = data.status || "Failed";
                                         state.failedCount += 1;
                                         if (data.error) showToast("error", row.name + ": " + data.error);
                                 }
@@ -1020,6 +1124,14 @@ SEND_QUOTE_SCRIPT = r"""
                 .then(function (data) {
                         state.rows = data.rows || [];
                         render();
+                })
+                .catch(function () {});
+
+        fetch("__API_PREFIX__/sent-rows")
+                .then(function (response) { return response.json(); })
+                .then(function (data) {
+                        state.sentRows = data.rows || [];
+                        renderSent();
                 })
                 .catch(function () {});
 })();
@@ -1628,6 +1740,7 @@ def import_send_quote_file(filename, file_bytes, kind="quote"):
         batch = SEND_LINK_BATCHES[kind]
         batch.clear()
         batch.extend(rows)
+        save_pending_batch(kind)
 
         invalid_count = sum(1 for row in rows if not row["valid"])
         return {"success": True, "rows": rows, "total": len(rows), "invalidCount": invalid_count}, 200
@@ -1637,9 +1750,18 @@ def set_send_quote_status(row_id, new_status, kind="quote"):
         """Returns (payload, http_status)."""
         if new_status not in SEND_QUOTE_STATUSES:
                 return {"success": False, "error": "Invalid status."}, 400
+
+        if new_status == "Sent":
+                row = remove_row_from_batch(kind, row_id)
+                if row is None:
+                        return {"success": False, "error": "Row not found."}, 404
+                moved = move_row_to_sent(kind, row)
+                return {"success": True, "sentAt": moved["sentAt"]}, 200
+
         for row in SEND_LINK_BATCHES[kind]:
                 if row["id"] == row_id:
                         row["status"] = new_status
+                        save_pending_batch(kind)
                         return {"success": True}, 200
         return {"success": False, "error": "Row not found."}, 404
 
@@ -1648,18 +1770,28 @@ def send_quote_for_row(row_id, kind="quote"):
         """Attempt automated send for one row. Returns (payload, http_status).
 
         When automation is unavailable (e.g. hosted server with no browser),
-        the payload includes a wa.me fallback link the frontend can open."""
+        the payload includes a wa.me fallback link the frontend can open.
+
+        On success the row is moved out of the pending batch and into the
+        sent list (with a sentAt timestamp)."""
         row = next((r for r in SEND_LINK_BATCHES[kind] if r["id"] == row_id), None)
         if row is None:
                 return {"success": False, "error": "Row not found."}, 404
         if not row["valid"]:
                 row["status"] = "Failed"
+                save_pending_batch(kind)
                 return {"success": False, "status": "Failed", "error": "Row has validation issues."}, 200
 
         ok, error, automation_available = send_whatsapp_quote(row, kind)
-        row["status"] = "Sent" if ok else "Failed"
-        payload = {"success": ok, "status": row["status"], "error": error}
-        if not ok and not automation_available:
+        if ok:
+                remove_row_from_batch(kind, row_id)
+                moved = move_row_to_sent(kind, row)
+                return {"success": True, "status": "Sent", "error": "", "sentAt": moved["sentAt"]}, 200
+
+        row["status"] = "Failed"
+        save_pending_batch(kind)
+        payload = {"success": False, "status": "Failed", "error": error}
+        if not automation_available:
                 payload["waLink"] = build_whatsapp_link(
                         row["mobileNumber"], build_send_quote_message(row, kind)
                 )
@@ -1883,6 +2015,8 @@ class AppHandler(BaseHTTPRequestHandler):
                         kind, action = send_link_action
                         if action == "rows":
                                 self.send_json_response(200, {"rows": SEND_LINK_BATCHES[kind]})
+                        elif action == "sent-rows":
+                                self.send_json_response(200, {"rows": SEND_LINK_SENT[kind]})
                         else:
                                 self.send_error(404, "Page not found")
                         return
@@ -2005,14 +2139,14 @@ def render_page(current_path, query_params, user=None):
         )
         customer_rows = "".join(customer_rows_list)
         if not customer_rows:
-                customer_rows = '<tr><td colspan="10">No active clients available.</td></tr>'
+                customer_rows = '<tr><td colspan="9">No active clients available.</td></tr>'
 
         new_customer_rows = "".join(
                 render_new_customer_row(customer, index, "/leads")
                 for index, customer in enumerate(new_customers)
         )
         if not new_customer_rows:
-                new_customer_rows = '<tr><td colspan="10">No leads available.</td></tr>'
+                new_customer_rows = '<tr><td colspan="9">No leads available.</td></tr>'
 
         reminder_rows_list = render_expiry_alert_rows(customers, today)
         reminder_rows_list.extend(render_expiry_alert_rows(xl_customers, today))
@@ -2028,7 +2162,7 @@ def render_page(current_path, query_params, user=None):
                 build_add_customer_card("/leads")
                 + edit_card
                 + '<div class="card"><h2>Leads</h2><table>'
-                '<thead><tr><th>Name</th><th>Age</th><th>Mobile Number</th><th>Car Type</th><th>Car Brand</th><th>Car Model</th><th>Year</th><th>Policy Number</th><th>Policy Expiry Date</th><th>Action</th></tr></thead>'
+                '<thead><tr><th>Name</th><th>Mobile Number</th><th>Car Type</th><th>Car Brand</th><th>Car Model</th><th>Year</th><th>Policy Number</th><th>Policy Expiry Date</th><th>Action</th></tr></thead>'
                 f'<tbody>{new_customer_rows}</tbody>'
                 '</table></div>'
         )
@@ -2037,7 +2171,7 @@ def render_page(current_path, query_params, user=None):
                 edit_card
                 + active_filter_card
                 + '<div class="card"><h2>Active Client</h2><div class="table-scroll"><table>'
-                '<thead><tr><th>Name</th><th>Age</th><th>Mobile Number</th><th>Car Type</th><th>Car Brand</th><th>Car Model</th><th>Year</th><th>Policy Number</th><th>Policy Expiry Date</th><th>Action</th></tr></thead>'
+                '<thead><tr><th>Name</th><th>Mobile Number</th><th>Car Type</th><th>Car Brand</th><th>Car Model</th><th>Year</th><th>Policy Number</th><th>Policy Expiry Date</th><th>Action</th></tr></thead>'
                 f'<tbody>{customer_rows}</tbody>'
                 '</table></div></div>'
         )

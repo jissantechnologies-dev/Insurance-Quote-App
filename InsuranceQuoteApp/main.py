@@ -24,6 +24,8 @@ NEW_CUSTOMERS_TEXT_PATH = BASE_DIR / "newcustomer.txt"
 NEW_CUSTOMERS_EXCEL_PATH = BASE_DIR / "newcustomer.xlsx"
 ALLOWED_PAGE_PATHS = {"/", "/leads", "/active-clients", "/expiry-alerts", "/send-quote"}
 
+import auth
+
 SEND_QUOTE_COLUMNS = [
         ("name", "Name", ("name", "customer name")),
         ("mobileNumber", "Mobile Number", ("mobile number", "mobile", "mobilenumber", "phone", "phone number")),
@@ -1614,6 +1616,30 @@ def send_quote_for_row(row_id):
 
 
 class AppHandler(BaseHTTPRequestHandler):
+        def get_current_user(self):
+                cookies = auth.parse_cookie_header(self.headers.get("Cookie", ""))
+                return auth.get_session_user(cookies.get(auth.SESSION_COOKIE_NAME))
+
+        def send_redirect(self, location, set_cookie=None):
+                self.send_response(303)
+                self.send_header("Location", location)
+                if set_cookie:
+                        self.send_header("Set-Cookie", set_cookie)
+                self.end_headers()
+
+        def send_html_response(self, html, status_code=200):
+                body = html.encode("utf-8")
+                self.send_response(status_code)
+                self.send_header("Content-type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        def read_post_form(self):
+                content_length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(content_length).decode("utf-8", errors="ignore")
+                return parse_qs(body)
+
         def send_json_response(self, status_code, payload):
                 body = json.dumps(payload).encode("utf-8")
                 self.send_response(status_code)
@@ -1665,6 +1691,59 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.send_json_response(status_code, response_payload)
 
         def do_POST(self):
+                if self.path == "/login":
+                        post_data = self.read_post_form()
+                        username = extract_post_value(post_data, "username")
+                        password = extract_post_value(post_data, "password")
+                        user, error = auth.authenticate(username, password)
+                        if user is None:
+                                self.send_html_response(auth.render_login_page(error=error))
+                                return
+                        token = auth.create_session_token(user["username"])
+                        self.send_redirect("/", set_cookie=auth.build_session_cookie(token))
+                        return
+
+                if self.path == "/register":
+                        post_data = self.read_post_form()
+                        ok, error = auth.register_user(
+                                extract_post_value(post_data, "username"),
+                                extract_post_value(post_data, "password"),
+                                extract_post_value(post_data, "fullName"),
+                                extract_post_value(post_data, "mobileNumber"),
+                        )
+                        if not ok:
+                                self.send_html_response(auth.render_register_page(error=error))
+                                return
+                        self.send_html_response(
+                                auth.render_login_page(message="Registration received. You can log in after an admin approves your account.")
+                        )
+                        return
+
+                user = self.get_current_user()
+                if user is None:
+                        self.send_redirect("/login")
+                        return
+
+                if self.path == "/logout":
+                        self.send_redirect("/login", set_cookie=auth.build_logout_cookie())
+                        return
+
+                if self.path == "/admin/user-action":
+                        if user.get("role") != "admin":
+                                self.send_error(403, "Admin access required")
+                                return
+                        post_data = self.read_post_form()
+                        target = extract_post_value(post_data, "username")
+                        action = extract_post_value(post_data, "action")
+                        if action == "approve":
+                                auth.set_user_status(target, "approved")
+                        elif action == "reject":
+                                auth.set_user_status(target, "rejected")
+                        elif action == "delete":
+                                auth.delete_user(target)
+                        self.send_redirect("/admin/users")
+                        return
+
                 if self.path == "/api/send-quote/import":
                         self.handle_send_quote_import()
                         return
@@ -1710,9 +1789,6 @@ class AppHandler(BaseHTTPRequestHandler):
 
         def do_GET(self):
                 parsed = urlparse(self.path)
-                if parsed.path == "/api/send-quote/rows":
-                        self.send_json_response(200, {"rows": SEND_QUOTE_BATCH})
-                        return
 
                 if parsed.path == "/style.css":
                         css = STYLE_PATH.read_text(encoding="utf-8")
@@ -1722,20 +1798,81 @@ class AppHandler(BaseHTTPRequestHandler):
                         self.wfile.write(css.encode("utf-8"))
                         return
 
+                user = self.get_current_user()
+
+                if parsed.path == "/login":
+                        if user is not None:
+                                self.send_redirect("/")
+                                return
+                        self.send_html_response(auth.render_login_page())
+                        return
+
+                if parsed.path == "/register":
+                        self.send_html_response(auth.render_register_page())
+                        return
+
+                if parsed.path == "/logout":
+                        self.send_redirect("/login", set_cookie=auth.build_logout_cookie())
+                        return
+
+                if user is None:
+                        self.send_redirect("/login")
+                        return
+
+                if parsed.path == "/admin/users":
+                        if user.get("role") != "admin":
+                                self.send_error(403, "Admin access required")
+                                return
+                        self.send_html_response(render_admin_users_page(user))
+                        return
+
+                if parsed.path == "/api/send-quote/rows":
+                        self.send_json_response(200, {"rows": SEND_QUOTE_BATCH})
+                        return
+
                 current_path = parsed.path
                 if current_path not in ALLOWED_PAGE_PATHS:
                         self.send_error(404, "Page not found")
                         return
 
-                html = render_page(current_path, parse_qs(parsed.query))
-
-                self.send_response(200)
-                self.send_header("Content-type", "text/html; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(html.encode("utf-8"))
+                self.send_html_response(render_page(current_path, parse_qs(parsed.query), user))
 
 
-def render_page(current_path, query_params):
+def build_auth_nav_links(user):
+        """Returns (users_link_html, auth_link_html) for the top menu."""
+        if user is None:
+                return "", '<a class="menu-link" href="/login">Login</a>'
+        users_link = ""
+        if user.get("role") == "admin":
+                users_link = '<a class="menu-link" href="/admin/users">Users</a>'
+        display_name = escape(str(user.get("fullName") or user.get("username", "")))
+        auth_link = (
+                f'<a class="menu-link logout-link" href="/logout" '
+                f'onclick="return confirm(\'Log out?\')">Logout ({display_name})</a>'
+        )
+        return users_link, auth_link
+
+
+def render_with_template(page_content, user=None, active_path=""):
+        users_link, auth_link = build_auth_nav_links(user)
+        template = TEMPLATE_PATH.read_text(encoding="utf-8")
+        return (
+                template.replace("{{NAV_HOME_CLASS}}", build_nav_class(active_path, "/"))
+                .replace("{{NAV_LEADS_CLASS}}", build_nav_class(active_path, "/leads"))
+                .replace("{{NAV_ACTIVE_CLASS}}", build_nav_class(active_path, "/active-clients"))
+                .replace("{{NAV_EXPIRY_CLASS}}", build_nav_class(active_path, "/expiry-alerts"))
+                .replace("{{NAV_SENDQUOTE_CLASS}}", build_nav_class(active_path, "/send-quote"))
+                .replace("{{NAV_USERS_LINK}}", users_link)
+                .replace("{{NAV_AUTH_LINK}}", auth_link)
+                .replace("{{PAGE_CONTENT}}", page_content)
+        )
+
+
+def render_admin_users_page(user):
+        return render_with_template(auth.build_users_admin_content(), user, "/admin/users")
+
+
+def render_page(current_path, query_params, user=None):
         edit_source = extract_post_value(query_params, "edit_source")
         try:
                 edit_index = int(extract_post_value(query_params, "edit_index"))
@@ -1864,17 +2001,7 @@ def render_page(current_path, query_params):
         if current_path == "/send-quote":
                 page_content = build_send_quote_content()
 
-        template = TEMPLATE_PATH.read_text(encoding="utf-8")
-        html = (
-                template.replace("{{NAV_HOME_CLASS}}", build_nav_class(current_path, "/"))
-                .replace("{{NAV_LEADS_CLASS}}", build_nav_class(current_path, "/leads"))
-                .replace("{{NAV_ACTIVE_CLASS}}", build_nav_class(current_path, "/active-clients"))
-                .replace("{{NAV_EXPIRY_CLASS}}", build_nav_class(current_path, "/expiry-alerts"))
-                .replace("{{NAV_SENDQUOTE_CLASS}}", build_nav_class(current_path, "/send-quote"))
-                .replace("{{PAGE_CONTENT}}", page_content)
-        )
-
-        return html
+        return render_with_template(page_content, user, current_path)
 
 
 if __name__ == "__main__":

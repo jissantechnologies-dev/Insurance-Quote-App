@@ -12,9 +12,94 @@ import traceback
 
 from flask import Flask, Response, jsonify, redirect, request
 
+import auth
 import main as core
 
 app = Flask(__name__)
+
+
+def current_user():
+        return auth.get_session_user(request.cookies.get(auth.SESSION_COOKIE_NAME))
+
+
+@app.before_request
+def require_login():
+        if request.path in auth.PUBLIC_PATHS:
+                return None
+        if current_user() is None:
+                return redirect("/login", code=303)
+        return None
+
+
+@app.get("/login")
+def login_page():
+        if current_user() is not None:
+                return redirect("/", code=303)
+        return Response(auth.render_login_page(), mimetype="text/html")
+
+
+@app.post("/login")
+def login_submit():
+        user, error = auth.authenticate(request.form.get("username"), request.form.get("password"))
+        if user is None:
+                return Response(auth.render_login_page(error=error), mimetype="text/html")
+        response = redirect("/", code=303)
+        response.headers.add("Set-Cookie", auth.build_session_cookie(auth.create_session_token(user["username"])))
+        return response
+
+
+@app.get("/register")
+def register_page():
+        return Response(auth.render_register_page(), mimetype="text/html")
+
+
+@app.post("/register")
+def register_submit():
+        ok, error = auth.register_user(
+                request.form.get("username"),
+                request.form.get("password"),
+                request.form.get("fullName"),
+                request.form.get("mobileNumber"),
+        )
+        if not ok:
+                return Response(auth.render_register_page(error=error), mimetype="text/html")
+        return Response(
+                auth.render_login_page(
+                        message="Registration received. You can log in after an admin approves your account."
+                ),
+                mimetype="text/html",
+        )
+
+
+@app.route("/logout", methods=["GET", "POST"])
+def logout():
+        response = redirect("/login", code=303)
+        response.headers.add("Set-Cookie", auth.build_logout_cookie())
+        return response
+
+
+@app.get("/admin/users")
+def admin_users():
+        user = current_user()
+        if user is None or user.get("role") != "admin":
+                return Response("Admin access required", status=403, mimetype="text/plain")
+        return Response(core.render_admin_users_page(user), mimetype="text/html")
+
+
+@app.post("/admin/user-action")
+def admin_user_action():
+        user = current_user()
+        if user is None or user.get("role") != "admin":
+                return Response("Admin access required", status=403, mimetype="text/plain")
+        target = request.form.get("username", "")
+        action = request.form.get("action", "")
+        if action == "approve":
+                auth.set_user_status(target, "approved")
+        elif action == "reject":
+                auth.set_user_status(target, "rejected")
+        elif action == "delete":
+                auth.delete_user(target)
+        return redirect("/admin/users", code=303)
 
 
 # TEMPORARY: show the real traceback in the browser to debug the 500 errors.
@@ -38,7 +123,10 @@ def query_params():
 @app.get("/expiry-alerts")
 @app.get("/send-quote")
 def render_page_route():
-        return Response(core.render_page(request.path, query_params()), mimetype="text/html")
+        return Response(
+                core.render_page(request.path, query_params(), current_user()),
+                mimetype="text/html",
+        )
 
 
 @app.get("/style.css")

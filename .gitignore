@@ -1,0 +1,15 @@
+# User accounts and password hashes - created automatically on first run.
+# Never commit: contains credentials, and pushing/deploying would overwrite
+# the live user list on the server.
+InsuranceQuoteApp/users.json
+
+# Session signing secret - created automatically on first run.
+# If this leaked, anyone could forge a login cookie without a password.
+InsuranceQuoteApp/auth_secret.key
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Excel lock files
+~$*.xlsx

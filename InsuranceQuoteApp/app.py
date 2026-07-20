@@ -122,6 +122,7 @@ def query_params():
 @app.get("/active-clients")
 @app.get("/expiry-alerts")
 @app.get("/send-quote")
+@app.get("/send-payment-link")
 def render_page_route():
         return Response(
                 core.render_page(request.path, query_params(), current_user()),
@@ -155,32 +156,40 @@ def bulk_upload():
 
 
 @app.get("/api/send-quote/rows")
-def send_quote_rows():
-        return jsonify({"rows": core.SEND_QUOTE_BATCH})
+@app.get("/api/send-payment-link/rows")
+def send_link_rows():
+        kind, _ = core.get_send_link_api_action(request.path)
+        return jsonify({"rows": core.SEND_LINK_BATCHES[kind]})
 
 
 @app.post("/api/send-quote/import")
-def send_quote_import():
+@app.post("/api/send-payment-link/import")
+def send_link_import():
+        kind, _ = core.get_send_link_api_action(request.path)
         upload = request.files.get("excel_file")
         if upload is None:
                 return jsonify({"success": False, "error": "No file was uploaded."}), 400
-        payload, status_code = core.import_send_quote_file(upload.filename, upload.read())
+        payload, status_code = core.import_send_quote_file(upload.filename, upload.read(), kind)
         return jsonify(payload), status_code
 
 
 @app.post("/api/send-quote/status")
-def send_quote_status():
+@app.post("/api/send-payment-link/status")
+def send_link_status():
+        kind, _ = core.get_send_link_api_action(request.path)
         data = request.get_json(silent=True) or {}
         payload, status_code = core.set_send_quote_status(
-                data.get("id"), str(data.get("status", "")).strip()
+                data.get("id"), str(data.get("status", "")).strip(), kind
         )
         return jsonify(payload), status_code
 
 
 @app.post("/api/send-quote/send")
-def send_quote_send():
+@app.post("/api/send-payment-link/send")
+def send_link_send():
+        kind, _ = core.get_send_link_api_action(request.path)
         data = request.get_json(silent=True) or {}
-        payload, status_code = core.send_quote_for_row(data.get("id"))
+        payload, status_code = core.send_quote_for_row(data.get("id"), kind)
         return jsonify(payload), status_code
 
 

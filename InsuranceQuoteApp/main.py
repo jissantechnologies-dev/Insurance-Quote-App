@@ -22,20 +22,62 @@ STYLE_PATH = BASE_DIR / "style.css"
 CUSTOMERS_JSON_PATH = BASE_DIR / "customers.json"
 NEW_CUSTOMERS_TEXT_PATH = BASE_DIR / "newcustomer.txt"
 NEW_CUSTOMERS_EXCEL_PATH = BASE_DIR / "newcustomer.xlsx"
-ALLOWED_PAGE_PATHS = {"/", "/leads", "/active-clients", "/expiry-alerts", "/send-quote"}
+ALLOWED_PAGE_PATHS = {"/", "/leads", "/active-clients", "/expiry-alerts", "/send-quote", "/send-payment-link"}
 
 import auth
 
-SEND_QUOTE_COLUMNS = [
+SEND_QUOTE_BASE_COLUMNS = [
         ("name", "Name", ("name", "customer name")),
         ("mobileNumber", "Mobile Number", ("mobile number", "mobile", "mobilenumber", "phone", "phone number")),
         ("vehicleNumber", "Vehicle Number", ("vehicle number", "vehicle no", "vehicleno", "vehiclenumber", "registration number", "reg number", "regnumber")),
         ("expiryDate", "Expiry Date", ("expiry date", "policy expiry date", "expirydate")),
-        ("quoteLink", "Quote Link", ("quote link", "quotelink", "link")),
 ]
 SEND_QUOTE_STATUSES = ("Pending", "Sent", "Failed", "Delivered", "Read")
-SEND_QUOTE_BATCH = []
-SEND_QUOTE_NEXT_ID = [1]
+
+# Two instances of the same "import a list, pick rows, send WhatsApp
+# messages" workflow live on separate pages: Send Quote and Send Payment
+# Link. They share all logic below via the `kind` parameter ("quote" or
+# "payment") and only differ in copy, the link column header, and where
+# their in-memory batch/state is stored.
+SEND_LINK_KINDS = {
+        "quote": {
+                "page_title": "Send Quote",
+                "path": "/send-quote",
+                "api_prefix": "/api/send-quote",
+                "link_header": "Quote",
+                "link_aliases": ("quote link", "quotelink", "link", "quote"),
+                "view_label": "View Quote",
+                "send_btn_label": "Send Quote",
+                "message_intro": "Your renewal quote is ready.",
+        },
+        "payment": {
+                "page_title": "Send Payment Link",
+                "path": "/send-payment-link",
+                "api_prefix": "/api/send-payment-link",
+                "link_header": "Payment Link",
+                "link_aliases": ("payment link", "paymentlink", "link"),
+                "view_label": "View Payment Link",
+                "send_btn_label": "Send Payment Link",
+                "message_intro": "Please use the link below to complete your payment.",
+        },
+}
+SEND_LINK_BATCHES = {kind: [] for kind in SEND_LINK_KINDS}
+SEND_LINK_NEXT_ID = {kind: [1] for kind in SEND_LINK_KINDS}
+
+
+def get_send_link_columns(kind):
+        config = SEND_LINK_KINDS[kind]
+        return SEND_QUOTE_BASE_COLUMNS + [("quoteLink", config["link_header"], config["link_aliases"])]
+
+
+def get_send_link_api_action(path):
+        """Match an incoming request path like '/api/send-quote/import' or
+        '/api/send-payment-link/send' to (kind, action), or None."""
+        for kind, config in SEND_LINK_KINDS.items():
+                prefix = config["api_prefix"] + "/"
+                if path.startswith(prefix):
+                        return kind, path[len(prefix):]
+        return None
 
 
 def get_new_customers_excel_path():
@@ -599,10 +641,15 @@ def build_add_customer_card(return_to):
         )
 
 
-def build_send_quote_content():
+def build_send_quote_content(kind="quote"):
+        config = SEND_LINK_KINDS[kind]
+        script = (
+                SEND_QUOTE_SCRIPT.replace("__API_PREFIX__", config["api_prefix"])
+                .replace("__VIEW_LABEL__", config["view_label"])
+        )
         return (
                 '<div class="card">'
-                '<h2>Send Quote</h2>'
+                f'<h2>{escape(config["page_title"])}</h2>'
                 '<div class="send-quote-toolbar">'
                 '<label class="file-upload-label" for="sendQuoteFile">Import Excel'
                 '<input type="file" id="sendQuoteFile" accept=".xlsx,.xls,.csv" />'
@@ -621,7 +668,7 @@ def build_send_quote_content():
                 '</div>'
                 '<div class="selection-bar">'
                 '<span id="selectionCount">Selected: 0 Customers</span>'
-                '<button id="sendQuoteBtn" class="save-customer-btn" type="button" disabled>Send Quote</button>'
+                f'<button id="sendQuoteBtn" class="save-customer-btn" type="button" disabled>{escape(config["send_btn_label"])}</button>'
                 '</div>'
                 '</div>'
                 '<div class="table-scroll">'
@@ -632,7 +679,7 @@ def build_send_quote_content():
                 '<th class="sortable-th" data-sort="mobileNumber">Mobile Number</th>'
                 '<th class="sortable-th" data-sort="vehicleNumber">Vehicle Number</th>'
                 '<th class="sortable-th" data-sort="expiryDate">Expiry Date</th>'
-                '<th>Quote Link</th>'
+                f'<th>{escape(config["link_header"])}</th>'
                 '<th class="sortable-th" data-sort="status">Status</th>'
                 '</tr></thead>'
                 '<tbody id="sendQuoteTableBody"><tr><td colspan="7">Import an Excel/CSV file to get started.</td></tr></tbody>'
@@ -655,7 +702,7 @@ def build_send_quote_content():
                 '</div>'
                 '<div id="sendProgressModal" class="modal-overlay is-hidden">'
                 '<div class="modal-box">'
-                '<h3>Sending quotes...</h3>'
+                '<h3>Sending...</h3>'
                 '<div class="progress-bar-track"><div id="sendProgressBar" class="progress-bar-fill"></div></div>'
                 '<p id="sendProgressText">0 / 0 Sent</p>'
                 '<div id="sendQueueCurrent" class="send-queue-current"></div>'
@@ -665,7 +712,7 @@ def build_send_quote_content():
                 '</div>'
                 '</div>'
                 '<div id="toastContainer" class="toast-container"></div>'
-                '<script>' + SEND_QUOTE_SCRIPT + '</script>'
+                '<script>' + script + '</script>'
         )
 
 
@@ -782,7 +829,7 @@ SEND_QUOTE_SCRIPT = r"""
                                         "<td>" + escapeHtml(row.mobileNumber) + "</td>" +
                                         "<td>" + escapeHtml(row.vehicleNumber) + "</td>" +
                                         "<td>" + escapeHtml(row.expiryDate) + "</td>" +
-                                        '<td><a href="' + escapeHtml(row.quoteLink) + '" target="_blank" rel="noopener noreferrer">View Quote</a></td>' +
+                                        '<td><a href="' + escapeHtml(row.quoteLink) + '" target="_blank" rel="noopener noreferrer">__VIEW_LABEL__</a></td>' +
                                         '<td><span class="' + statusClass(row.status) + '">' + escapeHtml(row.status) + "</span></td>" +
                                         "</tr>";
                         }).join("");
@@ -860,7 +907,7 @@ SEND_QUOTE_SCRIPT = r"""
                 var formData = new FormData();
                 formData.append("excel_file", file);
 
-                fetch("/api/send-quote/import", { method: "POST", body: formData })
+                fetch("__API_PREFIX__/import", { method: "POST", body: formData })
                         .then(function (response) { return response.json().then(function (data) { return { ok: response.ok, data: data }; }); })
                         .then(function (result) {
                                 if (!result.ok || !result.data.success) {
@@ -915,7 +962,7 @@ SEND_QUOTE_SCRIPT = r"""
                         "<p><strong>Sending to " + escapeHtml(row.name) + "</strong> &middot; " + escapeHtml(row.mobileNumber) + "...</p>" +
                         "<p>WhatsApp Web will open and send the message automatically. Please don't touch the keyboard or mouse.</p>";
 
-                fetch("/api/send-quote/send", {
+                fetch("__API_PREFIX__/send", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({ id: row.id })
@@ -929,7 +976,7 @@ SEND_QUOTE_SCRIPT = r"""
                                         row.status = "Sent";
                                         state.sentCount += 1;
                                         showToast("success", row.name + ": WhatsApp opened - press Send in the new tab.");
-                                        return fetch("/api/send-quote/status", {
+                                        return fetch("__API_PREFIX__/status", {
                                                 method: "POST",
                                                 headers: { "Content-Type": "application/json" },
                                                 body: JSON.stringify({ id: row.id, status: "Sent" })
@@ -968,7 +1015,7 @@ SEND_QUOTE_SCRIPT = r"""
                 sendProgressModal.classList.add("is-hidden");
         });
 
-        fetch("/api/send-quote/rows")
+        fetch("__API_PREFIX__/rows")
                 .then(function (response) { return response.json(); })
                 .then(function (data) {
                         state.rows = data.rows || [];
@@ -1064,20 +1111,21 @@ def is_valid_quote_link(text):
         return raw.startswith("http://") or raw.startswith("https://")
 
 
-def build_send_quote_message(row):
+def build_send_quote_message(row, kind="quote"):
+        config = SEND_LINK_KINDS[kind]
         return (
                 f"Hello {row['name']},\n\n"
                 f"Your motor insurance for vehicle {row['vehicleNumber']} is due to expire on {row['expiryDate']}.\n\n"
-                "Your renewal quote is ready.\n\n"
-                "Please click the link below to view your quote and renew your policy:\n"
+                f"{config['message_intro']}\n\n"
+                "Please click the link below:\n"
                 f"{row['quoteLink']}\n\n"
                 "If you have any questions, feel free to contact us.\n\n"
                 "Thank you,\nGravity Insurance"
         )
 
 
-def send_whatsapp_quote(row):
-        """Send the quote via WhatsApp Web automation.
+def send_whatsapp_quote(row, kind="quote"):
+        """Send the quote/payment link via WhatsApp Web automation.
 
         Returns (ok, error_message, automation_available)."""
         try:
@@ -1088,7 +1136,7 @@ def send_whatsapp_quote(row):
         try:
                 pywhatkit.sendwhatmsg_instantly(
                         phone_no="+" + row["mobileNumber"],
-                        message=build_send_quote_message(row),
+                        message=build_send_quote_message(row, kind),
                         wait_time=25,
                         tab_close=True,
                         close_time=4,
@@ -1169,9 +1217,10 @@ def parse_send_quote_upload(filename, file_bytes):
         return None, None, "Unsupported file type. Please upload a .xlsx, .xls, or .csv file."
 
 
-def build_send_quote_rows(raw_rows, column_keys):
+def build_send_quote_rows(raw_rows, column_keys, kind="quote"):
         seen_keys = set()
         result_rows = []
+        next_id_holder = SEND_LINK_NEXT_ID[kind]
 
         for raw in raw_rows:
                 name = str(raw.get(column_keys["name"], "")).strip()
@@ -1199,7 +1248,7 @@ def build_send_quote_rows(raw_rows, column_keys):
                         issues.append("Invalid expiry date")
 
                 if not is_valid_quote_link(quote_link):
-                        issues.append("Invalid quote link URL")
+                        issues.append(f"Invalid {SEND_LINK_KINDS[kind]['link_header'].lower()} URL")
 
                 dedupe_key = (mobile, vehicle.strip().lower())
                 if mobile and vehicle and dedupe_key in seen_keys:
@@ -1207,8 +1256,8 @@ def build_send_quote_rows(raw_rows, column_keys):
                 else:
                         seen_keys.add(dedupe_key)
 
-                row_id = SEND_QUOTE_NEXT_ID[0]
-                SEND_QUOTE_NEXT_ID[0] += 1
+                row_id = next_id_holder[0]
+                next_id_holder[0] += 1
 
                 result_rows.append(
                         {
@@ -1551,8 +1600,9 @@ def perform_form_action(path, post_data):
         return return_to
 
 
-def import_send_quote_file(filename, file_bytes):
-        """Parse an uploaded send-quote file and replace the current batch.
+def import_send_quote_file(filename, file_bytes, kind="quote"):
+        """Parse an uploaded send-quote/send-payment-link file and replace the
+        current batch for that kind.
 
         Returns (payload, http_status) ready for a JSON response."""
         normalized_headers, raw_rows, error = parse_send_quote_upload(filename, file_bytes)
@@ -1561,7 +1611,7 @@ def import_send_quote_file(filename, file_bytes):
 
         missing_columns = []
         column_keys = {}
-        for field_key, display_name, aliases in SEND_QUOTE_COLUMNS:
+        for field_key, display_name, aliases in get_send_link_columns(kind):
                 found = find_send_quote_column(normalized_headers, aliases)
                 if found is None:
                         missing_columns.append(display_name)
@@ -1574,43 +1624,44 @@ def import_send_quote_file(filename, file_bytes):
                         "error": "Missing required column(s): " + ", ".join(missing_columns),
                 }, 400
 
-        rows = build_send_quote_rows(raw_rows, column_keys)
-        SEND_QUOTE_BATCH.clear()
-        SEND_QUOTE_BATCH.extend(rows)
+        rows = build_send_quote_rows(raw_rows, column_keys, kind)
+        batch = SEND_LINK_BATCHES[kind]
+        batch.clear()
+        batch.extend(rows)
 
         invalid_count = sum(1 for row in rows if not row["valid"])
         return {"success": True, "rows": rows, "total": len(rows), "invalidCount": invalid_count}, 200
 
 
-def set_send_quote_status(row_id, new_status):
+def set_send_quote_status(row_id, new_status, kind="quote"):
         """Returns (payload, http_status)."""
         if new_status not in SEND_QUOTE_STATUSES:
                 return {"success": False, "error": "Invalid status."}, 400
-        for row in SEND_QUOTE_BATCH:
+        for row in SEND_LINK_BATCHES[kind]:
                 if row["id"] == row_id:
                         row["status"] = new_status
                         return {"success": True}, 200
         return {"success": False, "error": "Row not found."}, 404
 
 
-def send_quote_for_row(row_id):
+def send_quote_for_row(row_id, kind="quote"):
         """Attempt automated send for one row. Returns (payload, http_status).
 
         When automation is unavailable (e.g. hosted server with no browser),
         the payload includes a wa.me fallback link the frontend can open."""
-        row = next((r for r in SEND_QUOTE_BATCH if r["id"] == row_id), None)
+        row = next((r for r in SEND_LINK_BATCHES[kind] if r["id"] == row_id), None)
         if row is None:
                 return {"success": False, "error": "Row not found."}, 404
         if not row["valid"]:
                 row["status"] = "Failed"
                 return {"success": False, "status": "Failed", "error": "Row has validation issues."}, 200
 
-        ok, error, automation_available = send_whatsapp_quote(row)
+        ok, error, automation_available = send_whatsapp_quote(row, kind)
         row["status"] = "Sent" if ok else "Failed"
         payload = {"success": ok, "status": row["status"], "error": error}
         if not ok and not automation_available:
                 payload["waLink"] = build_whatsapp_link(
-                        row["mobileNumber"], build_send_quote_message(row)
+                        row["mobileNumber"], build_send_quote_message(row, kind)
                 )
         return payload, 200
 
@@ -1648,7 +1699,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
 
-        def handle_send_quote_import(self):
+        def handle_send_quote_import(self, kind):
                 content_length = int(self.headers.get("Content-Length", "0"))
                 content_type = self.headers.get("Content-Type", "")
                 body_bytes = self.rfile.read(content_length)
@@ -1661,10 +1712,10 @@ class AppHandler(BaseHTTPRequestHandler):
 
                 filename = upload_item.get("filename", "")
                 file_bytes = upload_item.get("content", b"")
-                payload, status_code = import_send_quote_file(filename, file_bytes)
+                payload, status_code = import_send_quote_file(filename, file_bytes, kind)
                 self.send_json_response(status_code, payload)
 
-        def handle_send_quote_status(self):
+        def handle_send_quote_status(self, kind):
                 content_length = int(self.headers.get("Content-Length", "0"))
                 body_bytes = self.rfile.read(content_length)
                 try:
@@ -1674,11 +1725,11 @@ class AppHandler(BaseHTTPRequestHandler):
                         return
 
                 response_payload, status_code = set_send_quote_status(
-                        payload.get("id"), str(payload.get("status", "")).strip()
+                        payload.get("id"), str(payload.get("status", "")).strip(), kind
                 )
                 self.send_json_response(status_code, response_payload)
 
-        def handle_send_quote_send(self):
+        def handle_send_quote_send(self, kind):
                 content_length = int(self.headers.get("Content-Length", "0"))
                 body_bytes = self.rfile.read(content_length)
                 try:
@@ -1687,7 +1738,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         self.send_json_response(400, {"success": False, "error": "Invalid request."})
                         return
 
-                response_payload, status_code = send_quote_for_row(payload.get("id"))
+                response_payload, status_code = send_quote_for_row(payload.get("id"), kind)
                 self.send_json_response(status_code, response_payload)
 
         def do_POST(self):
@@ -1744,14 +1795,15 @@ class AppHandler(BaseHTTPRequestHandler):
                         self.send_redirect("/admin/users")
                         return
 
-                if self.path == "/api/send-quote/import":
-                        self.handle_send_quote_import()
-                        return
-                if self.path == "/api/send-quote/status":
-                        self.handle_send_quote_status()
-                        return
-                if self.path == "/api/send-quote/send":
-                        self.handle_send_quote_send()
+                send_link_action = get_send_link_api_action(self.path)
+                if send_link_action is not None:
+                        kind, action = send_link_action
+                        if action == "import":
+                                self.handle_send_quote_import(kind)
+                        elif action == "status":
+                                self.handle_send_quote_status(kind)
+                        elif action == "send":
+                                self.handle_send_quote_send(kind)
                         return
 
                 if self.path not in ("/add-customer", "/convert-customer", "/delete-customer", "/edit-customer", "/bulk-upload-customers"):
@@ -1826,8 +1878,13 @@ class AppHandler(BaseHTTPRequestHandler):
                         self.send_html_response(render_admin_users_page(user))
                         return
 
-                if parsed.path == "/api/send-quote/rows":
-                        self.send_json_response(200, {"rows": SEND_QUOTE_BATCH})
+                send_link_action = get_send_link_api_action(parsed.path)
+                if send_link_action is not None:
+                        kind, action = send_link_action
+                        if action == "rows":
+                                self.send_json_response(200, {"rows": SEND_LINK_BATCHES[kind]})
+                        else:
+                                self.send_error(404, "Page not found")
                         return
 
                 current_path = parsed.path
@@ -1862,6 +1919,7 @@ def render_with_template(page_content, user=None, active_path=""):
                 .replace("{{NAV_ACTIVE_CLASS}}", build_nav_class(active_path, "/active-clients"))
                 .replace("{{NAV_EXPIRY_CLASS}}", build_nav_class(active_path, "/expiry-alerts"))
                 .replace("{{NAV_SENDQUOTE_CLASS}}", build_nav_class(active_path, "/send-quote"))
+                .replace("{{NAV_SENDPAYMENT_CLASS}}", build_nav_class(active_path, "/send-payment-link"))
                 .replace("{{NAV_USERS_LINK}}", users_link)
                 .replace("{{NAV_AUTH_LINK}}", auth_link)
                 .replace("{{PAGE_CONTENT}}", page_content)
@@ -1999,7 +2057,9 @@ def render_page(current_path, query_params, user=None):
         if current_path == "/expiry-alerts":
                 page_content = expiry_content
         if current_path == "/send-quote":
-                page_content = build_send_quote_content()
+                page_content = build_send_quote_content("quote")
+        if current_path == "/send-payment-link":
+                page_content = build_send_quote_content("payment")
 
         return render_with_template(page_content, user, current_path)
 

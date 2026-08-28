@@ -9,8 +9,9 @@ local development server (py main.py).
 """
 
 import traceback
+from urllib.parse import quote_plus
 
-from flask import Flask, Response, jsonify, redirect, request
+from flask import Flask, Response, jsonify, redirect, request, send_file
 
 import auth
 import main as core
@@ -153,6 +154,31 @@ def bulk_upload():
         if upload is not None:
                 core.append_new_customers_from_excel_bytes(upload.read())
         return redirect(return_to, code=303)
+
+
+@app.post("/upload-document")
+def upload_document():
+        source = core.sanitize_form_value(request.form.get("source", ""))
+        try:
+                index = int(core.sanitize_form_value(request.form.get("index", "")))
+        except ValueError:
+                index = -1
+        doc_type = core.sanitize_form_value(request.form.get("doc_type", ""))
+        return_to = core.sanitize_return_to(
+                core.sanitize_form_value(request.form.get("return_to", "/leads"))
+        )
+        upload = request.files.get("document")
+        if upload is not None and upload.filename:
+                core.handle_document_upload(source, index, doc_type, upload.filename, upload.read())
+        return redirect(f"{return_to}?edit_source={quote_plus(source)}&edit_index={index}", code=303)
+
+
+@app.get("/documents/<doc_id>/<doc_type>")
+def get_document(doc_id, doc_type):
+        doc_path = core.get_customer_document_path(doc_id, doc_type)
+        if doc_path is None:
+                return Response("Not found", status=404, mimetype="text/plain")
+        return send_file(doc_path, as_attachment=False, download_name=doc_path.name)
 
 
 @app.get("/api/send-quote/rows")

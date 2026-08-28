@@ -1,14 +1,16 @@
 [
     {
         "name": "Saravanan",
-        "age": 35,
+        "age": "35",
         "mobileNumber": "9941456453",
         "carType": "SUV",
         "carBrand": "Hyundai",
         "carModel": "Creta",
-        "yearOfManufacture": 2021,
+        "yearOfManufacture": "2021",
         "PolicyNumber": "ROY2607001",
-        "policyExpiryDate": "2026-07-14"
+        "policyExpiryDate": "2026-07-14",
+        "commission": "1000",
+        "commissionType": "flat"
     },
     {
         "name": "Ravi",
@@ -23,14 +25,16 @@
     },
     {
         "name": "Kousigan",
-        "age": 20,
+        "age": "20",
         "mobileNumber": "9988776655",
         "carType": "Hatchback",
         "carBrand": "Maruti Suzuki",
         "carModel": "Baleno",
-        "yearOfManufacture": 2022,
+        "yearOfManufacture": "2022",
         "PolicyNumber": "HDF2607003",
-        "policyExpiryDate": "2027-05-20"
+        "policyExpiryDate": "2027-05-20",
+        "commission": "10",
+        "commissionType": "percent"
     },
     {
         "name": "Balaji",

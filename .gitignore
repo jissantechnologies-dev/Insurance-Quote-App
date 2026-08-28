@@ -25,3 +25,7 @@ InsuranceQuoteApp/sent_quote.json
 InsuranceQuoteApp/sent_payment.json
 InsuranceQuoteApp/batch_quote.json
 InsuranceQuoteApp/batch_payment.json
+
+# Uploaded customer documents (RC book, Aadhar, PAN, previous policy) - live
+# data written by the running server, contains sensitive PII.
+InsuranceQuoteApp/documents/

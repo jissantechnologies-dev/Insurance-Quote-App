@@ -1,5 +1,8 @@
 import csv
 import json
+import mimetypes
+import re
+import uuid
 from io import BytesIO
 from collections import Counter
 from datetime import date, datetime
@@ -24,6 +27,23 @@ CUSTOMERS_JSON_PATH = BASE_DIR / "customers.json"
 NEW_CUSTOMERS_TEXT_PATH = BASE_DIR / "newcustomer.txt"
 NEW_CUSTOMERS_EXCEL_PATH = BASE_DIR / "newcustomer.xlsx"
 ALLOWED_PAGE_PATHS = {"/", "/leads", "/active-clients", "/expiry-alerts", "/send-quote", "/send-payment-link"}
+
+DOCUMENTS_DIR = BASE_DIR / "documents"
+DOCUMENT_TYPES = [
+        ("rc_book", "RC Book"),
+        ("previous_policy", "Previous Policy Copy"),
+        ("aadhar", "Aadhar Card"),
+        ("pan", "PAN Card"),
+]
+DOCUMENT_TYPE_KEYS = {key for key, _ in DOCUMENT_TYPES}
+DOC_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+
+CHART_LEGEND_HTML = (
+        '<div class="chart-legend">'
+        '<span class="legend-item"><span class="legend-swatch legend-revenue"></span>Revenue</span>'
+        '<span class="legend-item"><span class="legend-swatch legend-commission"></span>Commission</span>'
+        '</div>'
+)
 
 # The hosted server's system clock may not be set to India time, so sent
 # timestamps are always computed in IST explicitly rather than relying on
@@ -190,6 +210,9 @@ def build_customer_line(customer):
                 "yearOfManufacture",
                 "PolicyNumber",
                 "policyExpiryDate",
+                "docId",
+                "commission",
+                "commissionType",
         ]
         return "|".join(sanitize_form_value(customer.get(key, "")) for key in ordered_keys)
 
@@ -226,6 +249,9 @@ def parse_customer_parts(parts):
                 "yearOfManufacture": parts[6] if len(parts) > 6 else "",
                 "PolicyNumber": parts[7] if len(parts) > 7 else "",
                 "policyExpiryDate": parts[8] if len(parts) > 8 else "",
+                "docId": parts[9] if len(parts) > 9 else "",
+                "commission": parts[10] if len(parts) > 10 else "",
+                "commissionType": parts[11] if len(parts) > 11 else "",
         }
 
 
@@ -240,6 +266,8 @@ def get_customer_from_post(post_data):
                 "yearOfManufacture": extract_post_value(post_data, "yearOfManufacture"),
                 "PolicyNumber": extract_post_value(post_data, "PolicyNumber"),
                 "policyExpiryDate": extract_post_value(post_data, "policyExpiryDate"),
+                "commission": extract_post_value(post_data, "commission"),
+                "commissionType": extract_post_value(post_data, "commissionType") or "flat",
         }
 
 
@@ -292,6 +320,16 @@ def find_excel_column(column_map, *aliases):
         return None
 
 
+def ensure_excel_column(sheet, column_map, header_name):
+        key = normalize_excel_header(header_name)
+        if key in column_map:
+                return column_map[key]
+        new_col = sheet.max_column + 1
+        sheet.cell(row=1, column=new_col).value = header_name
+        column_map[key] = new_col
+        return new_col
+
+
 def update_excel_customer(index, customer):
         excel_path = get_new_customers_excel_path()
         if excel_path is None or load_workbook is None:
@@ -320,6 +358,27 @@ def update_excel_customer(index, customer):
                 col_index = find_excel_column(column_map, *aliases)
                 if col_index:
                         sheet.cell(row=target_row, column=col_index).value = customer.get(customer_key, "")
+
+        doc_id_value = customer.get("docId", "")
+        if doc_id_value:
+                doc_col_index = find_excel_column(column_map, "document id", "docid") or ensure_excel_column(
+                        sheet, column_map, "Document ID"
+                )
+                sheet.cell(row=target_row, column=doc_col_index).value = doc_id_value
+
+        commission_value = customer.get("commission", "")
+        if commission_value not in (None, ""):
+                commission_col_index = find_excel_column(
+                        column_map, "commission", "commission amount", "commissionamount"
+                ) or ensure_excel_column(sheet, column_map, "Commission")
+                sheet.cell(row=target_row, column=commission_col_index).value = commission_value
+
+                commission_type_col_index = find_excel_column(
+                        column_map, "commission type", "commissiontype"
+                ) or ensure_excel_column(sheet, column_map, "Commission Type")
+                sheet.cell(row=target_row, column=commission_type_col_index).value = customer.get(
+                        "commissionType", "flat"
+                )
 
         workbook.save(excel_path)
         workbook.close()
@@ -376,6 +435,68 @@ def get_edit_customer(source, index):
         if index < 0 or index >= len(customers):
                 return None
         return customers[index]
+
+
+def get_or_create_doc_id(source, index):
+        customer = get_edit_customer(source, index)
+        if customer is None:
+                return None
+        doc_id = str(get_customer_value(customer, "docId")).strip()
+        if doc_id:
+                return doc_id
+        doc_id = uuid.uuid4().hex
+        customer = dict(customer)
+        customer["docId"] = doc_id
+        if not update_customer_by_source(source, index, customer):
+                return None
+        return doc_id
+
+
+def list_customer_documents(doc_id):
+        docs = {}
+        doc_id = str(doc_id or "").strip()
+        if not doc_id:
+                return docs
+        doc_dir = DOCUMENTS_DIR / doc_id
+        if not doc_dir.is_dir():
+                return docs
+        for doc_type, _ in DOCUMENT_TYPES:
+                matches = sorted(doc_dir.glob(f"{doc_type}.*"))
+                if matches:
+                        docs[doc_type] = matches[0].name
+        return docs
+
+
+def save_customer_document(doc_id, doc_type, filename, file_bytes):
+        if not doc_id or doc_type not in DOCUMENT_TYPE_KEYS or not file_bytes:
+                return False
+        extension = Path(str(filename or "")).suffix.lower()
+        if len(extension) > 10 or any(ch in extension for ch in ("/", "\\")):
+                extension = ""
+        doc_dir = DOCUMENTS_DIR / doc_id
+        doc_dir.mkdir(parents=True, exist_ok=True)
+        for existing in doc_dir.glob(f"{doc_type}.*"):
+                existing.unlink()
+        (doc_dir / f"{doc_type}{extension}").write_bytes(file_bytes)
+        return True
+
+
+def handle_document_upload(source, index, doc_type, filename, file_bytes):
+        doc_id = get_or_create_doc_id(source, index)
+        if doc_id is None:
+                return False
+        return save_customer_document(doc_id, doc_type, filename, file_bytes)
+
+
+def get_customer_document_path(doc_id, doc_type):
+        doc_id = str(doc_id or "").strip()
+        if not DOC_ID_PATTERN.match(doc_id) or doc_type not in DOCUMENT_TYPE_KEYS:
+                return None
+        doc_dir = DOCUMENTS_DIR / doc_id
+        if not doc_dir.is_dir():
+                return None
+        matches = sorted(doc_dir.glob(f"{doc_type}.*"))
+        return matches[0] if matches else None
 
 
 def convert_new_customer_to_existing(index):
@@ -462,6 +583,9 @@ def load_customers_from_excel_source(excel_source):
                                 "yearOfManufacture": get_excel_value(row, "year of manufacture", "year", "year of purchase"),
                                 "PolicyNumber": get_excel_value(row, "policy number", "policynumber", "policy no"),
                                 "policyExpiryDate": get_excel_value(row, "policy expiry date", "expiry date", "policyexpirydate"),
+                                "docId": get_excel_value(row, "document id", "docid"),
+                                "commission": get_excel_value(row, "commission", "commission amount", "commissionamount"),
+                                "commissionType": get_excel_value(row, "commission type", "commissiontype") or "flat",
                         }
                 )
 
@@ -638,10 +762,16 @@ def build_edit_customer_card(source, index, customer, return_to):
                 return ""
 
         safe_return_to = sanitize_return_to(return_to)
+        documents_section = build_documents_section(source, index, customer, safe_return_to)
 
         return (
                 '<div class="card">'
+                '<div class="card-header-row">'
                 '<h2>Edit Customer</h2>'
+                f'<a class="close-btn icon-btn" href="{escape(safe_return_to)}" title="Close" aria-label="Close">'
+                '<span class="btn-icon" aria-hidden="true">&#10005;</span>'
+                '</a>'
+                '</div>'
                 '<form class="add-customer-form" method="post" action="/edit-customer" onsubmit="return confirm(\'Are you sure you want to edit this customer?\')">'
                 f'<input type="hidden" name="source" value="{escape(source)}" />'
                 f'<input type="hidden" name="index" value="{escape(str(index))}" />'
@@ -655,10 +785,61 @@ def build_edit_customer_card(source, index, customer, return_to):
                 f'<label>Year <input type="number" name="yearOfManufacture" min="1900" max="2100" value="{escape(str(get_customer_value(customer, "yearOfManufacture", "yearOfPurchase", "year")))}" /></label>'
                 f'<label>Policy Number <input type="text" name="PolicyNumber" value="{escape(str(get_customer_value(customer, "PolicyNumber", "policyNumber", "policy_number")))}" required /></label>'
                 f'<label>Policy Expiry Date <input type="date" name="policyExpiryDate" value="{escape(str(get_customer_value(customer, "policyExpiryDate", "PolicyExpiryDate")))}" required /></label>'
-                '<button class="save-customer-btn" type="submit">Update Customer</button>'
+                + build_commission_field(customer)
+                + '<button class="save-customer-btn" type="submit">Update Customer</button>'
                 '</form>'
-                '</div>'
+                + documents_section
+                + '</div>'
         )
+
+
+def build_commission_field(customer=None):
+        commission_value = escape(str(get_customer_value(customer, "commission"))) if customer else ""
+        commission_type = str(get_customer_value(customer, "commissionType")) if customer else ""
+        commission_type = commission_type if commission_type in ("flat", "percent") else "flat"
+        flat_selected = " selected" if commission_type == "flat" else ""
+        percent_selected = " selected" if commission_type == "percent" else ""
+        return (
+                '<label class="commission-field">Commission'
+                '<span class="commission-inputs">'
+                f'<input type="number" name="commission" min="0" step="0.01" value="{commission_value}" placeholder="Amount" />'
+                '<select name="commissionType">'
+                f'<option value="flat"{flat_selected}>₹ Flat</option>'
+                f'<option value="percent"{percent_selected}>% of Premium</option>'
+                '</select>'
+                '</span>'
+                '</label>'
+        )
+
+
+def build_documents_section(source, index, customer, safe_return_to):
+        doc_id = str(get_customer_value(customer, "docId")).strip()
+        existing_docs = list_customer_documents(doc_id)
+
+        rows_html = []
+        for doc_key, doc_label in DOCUMENT_TYPES:
+                has_doc = doc_key in existing_docs
+                view_link = (
+                        f'<a class="menu-link" href="/documents/{escape(doc_id)}/{escape(doc_key)}" target="_blank" rel="noopener noreferrer">View</a>'
+                        if has_doc
+                        else '<span class="document-missing">Not uploaded</span>'
+                )
+                upload_form = (
+                        '<form class="document-upload-form" method="post" action="/upload-document" enctype="multipart/form-data">'
+                        f'<input type="hidden" name="source" value="{escape(source)}" />'
+                        f'<input type="hidden" name="index" value="{escape(str(index))}" />'
+                        f'<input type="hidden" name="doc_type" value="{escape(doc_key)}" />'
+                        f'<input type="hidden" name="return_to" value="{escape(safe_return_to)}" />'
+                        '<input type="file" name="document" required />'
+                        f'<button class="edit-btn" type="submit">{"Replace" if has_doc else "Upload"}</button>'
+                        '</form>'
+                )
+                rows_html.append(
+                        f'<div class="document-row"><span class="document-label">{escape(doc_label)}</span>'
+                        f'{view_link}{upload_form}</div>'
+                )
+
+        return '<div class="documents-section"><h3>Documents</h3>' + "".join(rows_html) + '</div>'
 
 
 def build_add_customer_card(return_to):
@@ -678,7 +859,8 @@ def build_add_customer_card(return_to):
                 '<label>Year <input type="number" name="yearOfManufacture" min="1900" max="2100" /></label>'
                 '<label>Policy Number <input type="text" name="PolicyNumber" required /></label>'
                 '<label>Policy Expiry Date <input type="date" name="policyExpiryDate" required /></label>'
-                '<button class="save-customer-btn" type="submit">Save Customer</button>'
+                + build_commission_field()
+                + '<button class="save-customer-btn" type="submit">Save Customer</button>'
                 '</form>'
                 '<hr class="section-divider" />'
                 '<h2>Bulk Upload from Excel</h2>'
@@ -1441,6 +1623,13 @@ def to_int(value, default=0):
                 return default
 
 
+def to_float(value, default=0.0):
+        try:
+                return float(str(value).strip())
+        except (TypeError, ValueError):
+                return default
+
+
 def format_inr(amount):
         return f"INR {amount:,.0f}"
 
@@ -1524,12 +1713,62 @@ def build_dashboard_content(customers, xl_customers, new_customers, reminder_row
                 segment = classify_vehicle_segment(customer.get("carType", customer.get("car", "")))
                 return segment_monthly_revenue.get(segment, 2800)
 
+        def customer_commission(customer):
+                commission_keys = ("commission", "Commission", "commissionAmount")
+                raw_value = None
+                for key in commission_keys:
+                        value = customer.get(key)
+                        if value not in (None, ""):
+                                raw_value = value
+                                break
+                if raw_value is None:
+                        return 0
+
+                parsed = to_float(raw_value, -1)
+                if parsed < 0:
+                        return 0
+
+                commission_type = str(
+                        customer.get("commissionType", customer.get("CommissionType", "flat")) or "flat"
+                ).strip().lower()
+                if commission_type == "percent":
+                        return int(round(customer_premium(customer) * parsed / 100))
+                return int(round(parsed))
+
+        def build_stacked_bar(label, value, commission, max_value, bar_class):
+                commission = max(0, min(commission, value))
+                revenue_pct = max(10, int((value / max_value) * 100)) if max_value else 10
+                commission_pct = int((commission / max_value) * 100) if max_value and commission > 0 else 0
+                commission_line = (
+                        f'<span class="revenue-commission-value">Commission {format_inr(commission)}</span>'
+                        if commission > 0
+                        else ""
+                )
+                return (
+                        '<div class="revenue-item">'
+                        f'<p class="revenue-value">{format_inr(value)} total{commission_line}</p>'
+                        '<div class="revenue-bars-pair">'
+                        f'<div class="bar-col" title="Revenue: {format_inr(value)}">'
+                        f'<div class="mini-bar revenue-fill {bar_class}" style="height: {revenue_pct}%;"></div>'
+                        '</div>'
+                        f'<div class="bar-col" title="Commission: {format_inr(commission)}">'
+                        f'<div class="mini-bar commission-fill" style="height: {commission_pct}%;"></div>'
+                        '</div>'
+                        '</div>'
+                        f'<p class="revenue-label">{escape(label)}</p>'
+                        '</div>'
+                )
+
+        # Each customer's revenue/commission is attributed only to the calendar
+        # month of their own policy renewal (policyExpiryDate) - a commission
+        # set on a July-renewal customer must only ever show up in the July
+        # bar, not spread across every month via a synthetic growth curve.
         month_labels = []
         month_revenues = []
-        month_factors = [0.76, 0.84, 0.9, 0.98, 1.06, 1.14]
+        month_commissions = []
         current_year = today.year
         current_month = today.month
-        for index, factor in enumerate(month_factors):
+        for index in range(6):
                 month_value = current_month - (5 - index)
                 year_value = current_year
                 while month_value <= 0:
@@ -1537,28 +1776,35 @@ def build_dashboard_content(customers, xl_customers, new_customers, reminder_row
                         year_value -= 1
                 month_start = datetime(year_value, month_value, 1).date()
                 month_labels.append(month_start.strftime("%b %Y"))
-                month_revenues.append(int(round(estimated_monthly_revenue * factor)))
 
-        max_revenue = max(month_revenues) if month_revenues else 1
+                month_revenue_total = 0
+                month_commission_total = 0
+                for customer in active_clients:
+                        expiry_text = str(customer.get("policyExpiryDate", customer.get("PolicyExpiryDate", "")))
+                        expiry_date = parse_policy_expiry(expiry_text)
+                        if not expiry_date or expiry_date.month != month_value:
+                                continue
+                        month_revenue_total += customer_premium(customer)
+                        month_commission_total += customer_commission(customer)
+                month_revenues.append(month_revenue_total)
+                month_commissions.append(min(month_commission_total, month_revenue_total))
+
+        max_revenue = max(month_revenues) if max(month_revenues, default=0) > 0 else 1
         revenue_bars = "".join(
-                (
-                        '<div class="revenue-item">'
-                        f'<p class="revenue-value">{format_inr(value)}</p>'
-                        f'<div class="revenue-bar" style="height: {max(10, int((value / max_revenue) * 100))}%;"></div>'
-                        f'<p class="revenue-label">{escape(label)}</p>'
-                        '</div>'
-                )
-                for label, value in zip(month_labels, month_revenues)
+                build_stacked_bar(label, value, commission, max_revenue, "")
+                for label, value, commission in zip(month_labels, month_revenues, month_commissions)
         )
 
         projection_labels = []
         projection_values = []
+        projection_commissions = []
         for offset in range(1, 7):
                 year_value, month_value = months_from_now(today, offset)
                 month_start = datetime(year_value, month_value, 1).date()
                 projection_labels.append(month_start.strftime("%b %Y"))
 
                 projected_total = 0
+                projected_commission = 0
                 for customer in active_clients:
                         expiry_text = str(customer.get("policyExpiryDate", customer.get("PolicyExpiryDate", "")))
                         expiry_date = parse_policy_expiry(expiry_text)
@@ -1566,18 +1812,14 @@ def build_dashboard_content(customers, xl_customers, new_customers, reminder_row
                                 continue
                         if expiry_date.year == year_value and expiry_date.month == month_value:
                                 projected_total += customer_premium(customer)
+                                projected_commission += customer_commission(customer)
                 projection_values.append(projected_total)
+                projection_commissions.append(min(projected_commission, projected_total))
 
         projection_max = max(projection_values) if max(projection_values, default=0) > 0 else 1
         projection_bars = "".join(
-                (
-                        '<div class="revenue-item">'
-                        f'<p class="revenue-value">{format_inr(value)}</p>'
-                        f'<div class="revenue-bar projection-bar" style="height: {max(10, int((value / projection_max) * 100))}%;"></div>'
-                        f'<p class="revenue-label">{escape(label)}</p>'
-                        '</div>'
-                )
-                for label, value in zip(projection_labels, projection_values)
+                build_stacked_bar(label, value, commission, projection_max, "projection-bar")
+                for label, value, commission in zip(projection_labels, projection_values, projection_commissions)
         )
 
         insurer_counts = Counter(
@@ -1636,14 +1878,16 @@ def build_dashboard_content(customers, xl_customers, new_customers, reminder_row
                 '</div>'
                 '<div class="card">'
                 '<h2>Monthly Revenue - Last 6 Months</h2>'
-                '<div class="revenue-chart">'
+                + CHART_LEGEND_HTML
+                + '<div class="revenue-chart">'
                 f'{revenue_bars}'
                 '</div>'
                 '</div>'
                 '<div class="card">'
                 '<h2>Projected Monthly Revenue - Next 6 Months</h2>'
-                '<p class="projection-note">Based on expiring client premium (or segment premium when missing).</p>'
-                '<div class="revenue-chart">'
+                '<p class="projection-note">Based on expiring client premium and commission (or segment premium when missing).</p>'
+                + CHART_LEGEND_HTML
+                + '<div class="revenue-chart">'
                 f'{projection_bars}'
                 '</div>'
                 '</div>'
@@ -1707,6 +1951,11 @@ def perform_form_action(path, post_data):
                 except ValueError:
                         index = -1
                 updated_customer = get_customer_from_post(post_data)
+                existing_customer = get_edit_customer(source, index)
+                if existing_customer is not None:
+                        existing_doc_id = str(get_customer_value(existing_customer, "docId")).strip()
+                        if existing_doc_id:
+                                updated_customer["docId"] = existing_doc_id
                 update_customer_by_source(source, index, updated_customer)
 
         return return_to
@@ -1938,11 +2187,51 @@ class AppHandler(BaseHTTPRequestHandler):
                                 self.handle_send_quote_send(kind)
                         return
 
-                if self.path not in ("/add-customer", "/convert-customer", "/delete-customer", "/edit-customer", "/bulk-upload-customers"):
+                if self.path not in (
+                        "/add-customer",
+                        "/convert-customer",
+                        "/delete-customer",
+                        "/edit-customer",
+                        "/bulk-upload-customers",
+                        "/upload-document",
+                ):
                         self.send_error(404, "Page not found")
                         return
 
                 content_length = int(self.headers.get("Content-Length", "0"))
+
+                if self.path == "/upload-document":
+                        return_to = "/leads"
+                        source = ""
+                        index = -1
+                        content_type = self.headers.get("Content-Type", "")
+                        if "multipart/form-data" in content_type:
+                                body_bytes = self.rfile.read(content_length)
+                                form_fields = parse_multipart_form_data(body_bytes, content_type)
+                                return_to = sanitize_return_to(
+                                        sanitize_form_value(form_fields.get("return_to", "/leads"))
+                                )
+                                source = sanitize_form_value(form_fields.get("source", ""))
+                                try:
+                                        index = int(sanitize_form_value(form_fields.get("index", "")))
+                                except ValueError:
+                                        index = -1
+                                doc_type = sanitize_form_value(form_fields.get("doc_type", ""))
+                                upload_item = form_fields.get("document")
+                                if isinstance(upload_item, dict):
+                                        handle_document_upload(
+                                                source, index, doc_type,
+                                                upload_item.get("filename", ""),
+                                                upload_item.get("content", b""),
+                                        )
+
+                        self.send_response(303)
+                        self.send_header(
+                                "Location",
+                                f"{return_to}?edit_source={quote_plus(source)}&edit_index={index}",
+                        )
+                        self.end_headers()
+                        return
 
                 if self.path == "/bulk-upload-customers":
                         return_to = "/leads"
@@ -2008,6 +2297,23 @@ class AppHandler(BaseHTTPRequestHandler):
                                 self.send_error(403, "Admin access required")
                                 return
                         self.send_html_response(render_admin_users_page(user))
+                        return
+
+                if parsed.path.startswith("/documents/"):
+                        doc_parts = parsed.path.split("/")
+                        doc_path = None
+                        if len(doc_parts) == 4:
+                                doc_path = get_customer_document_path(doc_parts[2], doc_parts[3])
+                        if doc_path is None:
+                                self.send_error(404, "Document not found")
+                                return
+                        content_type = mimetypes.guess_type(doc_path.name)[0] or "application/octet-stream"
+                        data = doc_path.read_bytes()
+                        self.send_response(200)
+                        self.send_header("Content-type", content_type)
+                        self.send_header("Content-Length", str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data)
                         return
 
                 send_link_action = get_send_link_api_action(parsed.path)

@@ -1,6 +1,7 @@
 import csv
 import json
 import mimetypes
+import os
 import re
 import uuid
 from io import BytesIO
@@ -2505,6 +2506,8 @@ def render_page(current_path, query_params, user=None):
 
 
 if __name__ == "__main__":
+        # The local dev server is plain HTTP, so session cookies must not be Secure.
+        os.environ.setdefault("GI_COOKIE_SECURE", "0")
         host, port = "127.0.0.1", 8000
         print(f"Server running at http://{host}:{port}")
         ThreadingHTTPServer((host, port), AppHandler).serve_forever()

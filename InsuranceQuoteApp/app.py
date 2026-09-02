@@ -8,6 +8,7 @@ All page rendering and data logic lives in main.py and is shared with the
 local development server (py main.py).
 """
 
+import os
 import traceback
 from urllib.parse import quote_plus
 
@@ -103,15 +104,27 @@ def admin_user_action():
         return redirect("/admin/users", code=303)
 
 
-# TEMPORARY: show the real traceback in the browser to debug the 500 errors.
-# Remove this handler once the issue is resolved.
 @app.errorhandler(Exception)
 def show_error(exc):
-        return Response(
-                "APP ERROR:\n\n" + traceback.format_exc(),
-                status=500,
-                mimetype="text/plain",
-        )
+        """Tracebacks leak file paths and source, so only show them when debugging."""
+        app.logger.exception("Unhandled error on %s", request.path)
+        if os.environ.get("GI_SHOW_TRACEBACKS") == "1":
+                return Response(
+                        "APP ERROR:\n\n" + traceback.format_exc(),
+                        status=500,
+                        mimetype="text/plain",
+                )
+        return Response("Something went wrong. Please try again.", status=500, mimetype="text/plain")
+
+
+@app.after_request
+def security_headers(response):
+        # Tell browsers to keep using https for this host (1 year).
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+        return response
 
 
 def query_params():

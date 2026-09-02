@@ -14,6 +14,7 @@ promote) or keep it private.
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import time
 from html import escape
@@ -200,15 +201,23 @@ def parse_cookie_header(cookie_header):
         return cookies
 
 
+def cookie_security_flags():
+        """"; Secure" unless GI_COOKIE_SECURE=0 (set by the local http dev server)."""
+        return "; Secure" if os.environ.get("GI_COOKIE_SECURE", "1") != "0" else ""
+
+
 def build_session_cookie(token):
         return (
-                f"{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; "
-                f"Max-Age={SESSION_DURATION_SECONDS}"
+                f"{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax"
+                f"{cookie_security_flags()}; Max-Age={SESSION_DURATION_SECONDS}"
         )
 
 
 def build_logout_cookie():
-        return f"{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+        return (
+                f"{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax"
+                f"{cookie_security_flags()}; Max-Age=0"
+        )
 
 
 # -------------------------------------------------------------- rendering

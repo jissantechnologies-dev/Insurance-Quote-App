@@ -15,6 +15,7 @@ from urllib.parse import quote_plus
 from flask import Flask, Response, jsonify, redirect, request, send_file
 
 import auth
+import legal
 import main as core
 
 app = Flask(__name__)
@@ -71,6 +72,16 @@ def register_submit():
                 ),
                 mimetype="text/html",
         )
+
+
+@app.get("/privacy-policy")
+def privacy_policy_page():
+        return Response(legal.render_privacy_policy_page(), mimetype="text/html")
+
+
+@app.get("/terms-and-conditions")
+def terms_page():
+        return Response(legal.render_terms_page(), mimetype="text/html")
 
 
 @app.route("/logout", methods=["GET", "POST"])

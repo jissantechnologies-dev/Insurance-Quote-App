@@ -52,6 +52,7 @@ CHART_LEGEND_HTML = (
 IST = ZoneInfo("Asia/Kolkata")
 
 import auth
+import legal
 
 SEND_QUOTE_BASE_COLUMNS = [
         ("name", "Name", ("name", "customer name")),
@@ -2283,6 +2284,14 @@ class AppHandler(BaseHTTPRequestHandler):
 
                 if parsed.path == "/register":
                         self.send_html_response(auth.render_register_page())
+                        return
+
+                if parsed.path == "/privacy-policy":
+                        self.send_html_response(legal.render_privacy_policy_page())
+                        return
+
+                if parsed.path == "/terms-and-conditions":
+                        self.send_html_response(legal.render_terms_page())
                         return
 
                 if parsed.path == "/logout":

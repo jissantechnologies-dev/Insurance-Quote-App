@@ -27,7 +27,15 @@ SECRET_KEY_PATH = BASE_DIR / "auth_secret.key"
 SESSION_COOKIE_NAME = "gi_session"
 SESSION_DURATION_SECONDS = 60 * 60 * 24 * 7  # 7 days
 
-PUBLIC_PATHS = {"/login", "/register", "/style.css", "/favicon.ico"}
+PUBLIC_PATHS = {
+        "/login",
+        "/register",
+        "/style.css",
+        "/favicon.ico",
+        # Meta's business verification fetches these anonymously.
+        "/privacy-policy",
+        "/terms-and-conditions",
+}
 
 DEFAULT_ADMIN = {
         "username": "admin",
@@ -245,6 +253,13 @@ AUTH_PAGE_TEMPLATE = """<!doctype html>
 </html>"""
 
 
+LEGAL_LINKS_HTML = (
+        '<p class="auth-legal-links">'
+        '<a href="/privacy-policy">Privacy Policy</a> &nbsp;&middot;&nbsp; '
+        '<a href="/terms-and-conditions">Terms and Conditions</a></p>'
+)
+
+
 def _alert(kind, message):
         if not message:
                 return ""
@@ -262,6 +277,7 @@ def render_login_page(error="", message=""):
                 '<button class="save-customer-btn" type="submit">Login</button>'
                 "</form>"
                 '<p class="auth-switch">New here? <a href="/register">Create an account</a></p>'
+                + LEGAL_LINKS_HTML
         )
         return AUTH_PAGE_TEMPLATE.format(title="Login", content=content)
 
@@ -279,6 +295,7 @@ def render_register_page(error=""):
                 '<button class="save-customer-btn" type="submit">Register</button>'
                 "</form>"
                 '<p class="auth-switch">Already have an account? <a href="/login">Login</a></p>'
+                + LEGAL_LINKS_HTML
         )
         return AUTH_PAGE_TEMPLATE.format(title="Register", content=content)
 

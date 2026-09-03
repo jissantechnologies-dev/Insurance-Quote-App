@@ -35,6 +35,8 @@ PUBLIC_PATHS = {
         # Meta's business verification fetches these anonymously.
         "/privacy-policy",
         "/terms-and-conditions",
+        # Meta's WhatsApp Cloud API calls this without a session cookie.
+        "/webhook/whatsapp",
 }
 
 DEFAULT_ADMIN = {

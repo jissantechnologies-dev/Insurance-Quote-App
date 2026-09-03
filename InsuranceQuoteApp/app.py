@@ -8,6 +8,7 @@ All page rendering and data logic lives in main.py and is shared with the
 local development server (py main.py).
 """
 
+import json
 import os
 import traceback
 from urllib.parse import quote_plus
@@ -248,6 +249,42 @@ def send_link_send():
         data = request.get_json(silent=True) or {}
         payload, status_code = core.send_quote_for_row(data.get("id"), kind)
         return jsonify(payload), status_code
+
+
+# --- WhatsApp Cloud API webhook -------------------------------------------
+# Meta -> Callback URL: https://app.gravityinsurance.in/webhook/whatsapp
+# The verify token must match the GI_WA_VERIFY_TOKEN environment variable.
+
+WA_VERIFY_TOKEN = os.environ.get("GI_WA_VERIFY_TOKEN", "")
+WA_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whatsapp_webhook.log")
+
+
+@app.get("/webhook/whatsapp")
+def whatsapp_webhook_verify():
+        """Meta's one-time subscription handshake."""
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge", "")
+        if mode == "subscribe" and WA_VERIFY_TOKEN and token == WA_VERIFY_TOKEN:
+                return Response(challenge, mimetype="text/plain")
+        return Response("Forbidden", status=403, mimetype="text/plain")
+
+
+@app.post("/webhook/whatsapp")
+def whatsapp_webhook_receive():
+        """Inbound messages and delivery-status callbacks.
+
+        Meta retries anything that is not a fast 200, so acknowledge first and
+        keep the handler cheap - for now the payload is just appended to a log.
+        """
+        payload = request.get_json(silent=True) or {}
+        try:
+                with open(WA_LOG_PATH, "a", encoding="utf-8") as handle:
+                        json.dump(payload, handle, ensure_ascii=False)
+                        handle.write("\n")
+        except OSError:
+                pass
+        return Response("EVENT_RECEIVED", status=200, mimetype="text/plain")
 
 
 # Passenger looks for this name.

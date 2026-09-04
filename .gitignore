@@ -30,3 +30,8 @@ InsuranceQuoteApp/batch_payment.json
 # data written by the running server, contains sensitive PII.
 InsuranceQuoteApp/documents/
 whatsapp_webhook.log
+# WhatsApp conversation history written by the running server - live
+# customer data, same reasoning as users.json above.
+InsuranceQuoteApp/messages.db
+InsuranceQuoteApp/messages.db-wal
+InsuranceQuoteApp/messages.db-shm

@@ -16,6 +16,7 @@ from urllib.parse import quote_plus
 from flask import Flask, Response, jsonify, redirect, request, send_file
 
 import auth
+import chat
 import legal
 import main as core
 
@@ -275,9 +276,15 @@ def whatsapp_webhook_receive():
         """Inbound messages and delivery-status callbacks.
 
         Meta retries anything that is not a fast 200, so acknowledge first and
-        keep the handler cheap - for now the payload is just appended to a log.
+        keep the handler cheap - store the messages, then append the raw
+        payload to a log for troubleshooting.
         """
         payload = request.get_json(silent=True) or {}
+        try:
+                chat.record_webhook(payload)
+        except Exception:
+                # Never let a storage failure turn into a retry storm from Meta.
+                traceback.print_exc()
         try:
                 with open(WA_LOG_PATH, "a", encoding="utf-8") as handle:
                         json.dump(payload, handle, ensure_ascii=False)
@@ -285,6 +292,19 @@ def whatsapp_webhook_receive():
         except OSError:
                 pass
         return Response("EVENT_RECEIVED", status=200, mimetype="text/plain")
+
+
+@app.get("/api/chat/<number>")
+def chat_thread(number):
+        payload, status_code = core.get_chat_thread(number)
+        return jsonify(payload), status_code
+
+
+@app.post("/api/chat/<number>/send")
+def chat_send(number):
+        data = request.get_json(silent=True) or {}
+        payload, status_code = core.send_chat_reply(number, data.get("message"))
+        return jsonify(payload), status_code
 
 
 # Passenger looks for this name.

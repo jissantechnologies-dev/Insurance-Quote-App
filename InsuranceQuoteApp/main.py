@@ -54,6 +54,7 @@ CHART_LEGEND_HTML = (
 IST = ZoneInfo("Asia/Kolkata")
 
 import auth
+import chat
 import legal
 
 SEND_QUOTE_BASE_COLUMNS = [
@@ -963,8 +964,9 @@ def build_send_quote_content(kind="quote"):
                 f'<th>{escape(config["link_header"])}</th>'
                 '<th>Status</th>'
                 '<th>Sent Date/Time</th>'
+                '<th>Chat</th>'
                 '</tr></thead>'
-                '<tbody id="sendQuoteSentTableBody"><tr><td colspan="7">No messages sent yet.</td></tr></tbody>'
+                '<tbody id="sendQuoteSentTableBody"><tr><td colspan="8">No messages sent yet.</td></tr></tbody>'
                 '</table>'
                 '</div>'
                 '</div>'
@@ -985,6 +987,20 @@ def build_send_quote_content(kind="quote"):
                 '<div id="sendQueueCurrent" class="send-queue-current"></div>'
                 '<div class="modal-actions">'
                 '<button id="closeProgressBtn" class="edit-btn" type="button">Done</button>'
+                '</div>'
+                '</div>'
+                '</div>'
+                '<div id="chatModal" class="modal-overlay is-hidden">'
+                '<div class="modal-box chat-box">'
+                '<div class="chat-header">'
+                '<h3 id="chatTitle">Chat</h3>'
+                '<button id="closeChatBtn" class="edit-btn" type="button">Close</button>'
+                '</div>'
+                '<div id="chatThread" class="chat-thread"></div>'
+                '<p id="chatWindowNote" class="chat-window-note"></p>'
+                '<div class="chat-composer">'
+                '<textarea id="chatInput" rows="2" placeholder="Type a reply..."></textarea>'
+                '<button id="chatSendBtn" class="save-customer-btn" type="button">Send</button>'
                 '</div>'
                 '</div>'
                 '</div>'
@@ -1033,6 +1049,105 @@ SEND_QUOTE_SCRIPT = r"""
         var sendQueueCurrent = document.getElementById("sendQueueCurrent");
         var closeProgressBtn = document.getElementById("closeProgressBtn");
         var toastContainer = document.getElementById("toastContainer");
+
+        var chatModal = document.getElementById("chatModal");
+        var chatTitle = document.getElementById("chatTitle");
+        var chatThread = document.getElementById("chatThread");
+        var chatInput = document.getElementById("chatInput");
+        var chatSendBtn = document.getElementById("chatSendBtn");
+        var chatWindowNote = document.getElementById("chatWindowNote");
+        var closeChatBtn = document.getElementById("closeChatBtn");
+        var chatState = { number: "", timer: null };
+
+        function describeWindow(win) {
+                if (!win.lastInboundAt) {
+                        return "This customer has not replied yet. You can only send an approved " +
+                                "template until they message you.";
+                }
+                if (!win.open) {
+                        return "The 24-hour reply window has closed. Wait for the customer to " +
+                                "message again before sending a free-form reply.";
+                }
+                var hours = Math.floor(win.secondsLeft / 3600);
+                var minutes = Math.floor((win.secondsLeft % 3600) / 60);
+                return "You can reply freely for another " + hours + "h " + minutes + "m.";
+        }
+
+        function renderChat(data) {
+                if (!data.messages.length) {
+                        chatThread.innerHTML = '<p class="chat-empty">No messages yet.</p>';
+                } else {
+                        chatThread.innerHTML = data.messages.map(function (m) {
+                                var cls = m.direction === "in" ? "chat-msg chat-in" : "chat-msg chat-out";
+                                var meta = escapeHtml(m.at);
+                                if (m.direction === "out" && m.status) meta += " &middot; " + escapeHtml(m.status);
+                                if (m.error) meta += " &middot; " + escapeHtml(m.error);
+                                return '<div class="' + cls + '"><div class="chat-body">' +
+                                        escapeHtml(m.body) + '</div><div class="chat-meta">' + meta + "</div></div>";
+                        }).join("");
+                        chatThread.scrollTop = chatThread.scrollHeight;
+                }
+
+                chatWindowNote.textContent = describeWindow(data.window);
+                chatWindowNote.className = "chat-window-note" + (data.window.open ? " is-open" : "");
+                chatInput.disabled = !data.window.open;
+                chatSendBtn.disabled = !data.window.open;
+        }
+
+        function loadChat() {
+                fetch("/api/chat/" + encodeURIComponent(chatState.number))
+                        .then(function (r) { return r.json(); })
+                        .then(renderChat)
+                        .catch(function () { /* transient poll failure - keep last view */ });
+        }
+
+        function openChat(number, name) {
+                chatState.number = number;
+                chatTitle.textContent = name + " (" + number + ")";
+                chatThread.innerHTML = '<p class="chat-empty">Loading...</p>';
+                chatModal.classList.remove("is-hidden");
+                loadChat();
+                chatState.timer = setInterval(loadChat, 5000);
+        }
+
+        function closeChat() {
+                chatModal.classList.add("is-hidden");
+                if (chatState.timer) clearInterval(chatState.timer);
+                chatState.timer = null;
+        }
+
+        sentTableBody.addEventListener("click", function (event) {
+                var button = event.target.closest(".chat-btn");
+                if (!button) return;
+                openChat(button.getAttribute("data-number"), button.getAttribute("data-name"));
+        });
+
+        closeChatBtn.addEventListener("click", closeChat);
+
+        chatSendBtn.addEventListener("click", function () {
+                var text = chatInput.value.trim();
+                if (!text) return;
+                chatSendBtn.disabled = true;
+                fetch("/api/chat/" + encodeURIComponent(chatState.number) + "/send", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ message: text })
+                })
+                        .then(function (r) { return r.json(); })
+                        .then(function (data) {
+                                if (data.success) {
+                                        chatInput.value = "";
+                                        loadChat();
+                                } else {
+                                        showToast("error", data.error || "Could not send the message.");
+                                        chatSendBtn.disabled = false;
+                                }
+                        })
+                        .catch(function () {
+                                showToast("error", "Could not reach the server.");
+                                chatSendBtn.disabled = false;
+                        });
+        });
 
         function showToast(type, message) {
                 var toast = document.createElement("div");
@@ -1126,7 +1241,7 @@ SEND_QUOTE_SCRIPT = r"""
 
         function renderSent() {
                 if (!state.sentRows.length) {
-                        sentTableBody.innerHTML = '<tr><td colspan="7">No messages sent yet.</td></tr>';
+                        sentTableBody.innerHTML = '<tr><td colspan="8">No messages sent yet.</td></tr>';
                         return;
                 }
                 sentTableBody.innerHTML = state.sentRows.map(function (row) {
@@ -1138,6 +1253,9 @@ SEND_QUOTE_SCRIPT = r"""
                                 '<td><a href="' + escapeHtml(row.quoteLink) + '" target="_blank" rel="noopener noreferrer">__VIEW_LABEL__</a></td>' +
                                 '<td><span class="' + statusClass(row.status) + '">' + escapeHtml(row.status) + "</span></td>" +
                                 "<td>" + escapeHtml(row.sentAt || "") + "</td>" +
+                                '<td><button type="button" class="edit-btn chat-btn" data-number="' +
+                                        escapeHtml(row.mobileNumber) + '" data-name="' +
+                                        escapeHtml(row.name) + '">View Chat</button></td>' +
                                 "</tr>";
                 }).join("");
         }
@@ -1490,7 +1608,12 @@ def send_whatsapp_cloud_api(row, kind="quote"):
         )
         try:
                 with urlopen(request, timeout=30) as response:
-                        json.loads(response.read().decode("utf-8"))
+                        body = json.loads(response.read().decode("utf-8"))
+                wamid = (body.get("messages") or [{}])[0].get("id", "")
+                chat.save_message(
+                        wamid, row["mobileNumber"], "out",
+                        build_send_quote_message(row, kind), status="sent",
+                )
                 return True, ""
         except HTTPError as exc:
                 # Meta puts the useful reason in the response body, not the status.
@@ -1503,6 +1626,78 @@ def send_whatsapp_cloud_api(row, kind="quote"):
                 return False, message
         except (URLError, OSError) as exc:
                 return False, f"Could not reach the WhatsApp API: {exc}"
+
+
+def send_whatsapp_text(number, text):
+        """Send a free-form (non-template) message.
+
+        Only valid inside the 24-hour customer service window; outside it Meta
+        rejects the call and the reason is passed back to the caller.
+        Returns (ok, error_message, wamid)."""
+        if not cloud_api_configured():
+                return False, "WhatsApp Cloud API is not configured on this server.", ""
+
+        payload = {
+                "messaging_product": "whatsapp",
+                "to": chat.normalize_number(number),
+                "type": "text",
+                "text": {"preview_url": True, "body": text},
+        }
+        request = Request(
+                f"https://graph.facebook.com/{WA_GRAPH_VERSION}/{WA_PHONE_NUMBER_ID}/messages",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                        "Authorization": f"Bearer {WA_TOKEN}",
+                        "Content-Type": "application/json",
+                },
+                method="POST",
+        )
+        try:
+                with urlopen(request, timeout=30) as response:
+                        body = json.loads(response.read().decode("utf-8"))
+                wamid = (body.get("messages") or [{}])[0].get("id", "")
+                return True, "", wamid
+        except HTTPError as exc:
+                try:
+                        detail = json.loads(exc.read().decode("utf-8"))
+                        error = detail.get("error", {})
+                        message = error.get("error_user_msg") or error.get("message") or str(exc)
+                except Exception:
+                        message = f"WhatsApp API returned HTTP {exc.code}."
+                return False, message, ""
+        except (URLError, OSError) as exc:
+                return False, f"Could not reach the WhatsApp API: {exc}", ""
+
+
+def get_chat_thread(number):
+        payload = {
+                "messages": chat.get_thread(number),
+                "window": chat.window_state(number),
+                "configured": cloud_api_configured(),
+        }
+        return payload, 200
+
+
+def send_chat_reply(number, text):
+        """Send an agent reply from the chat drawer and record it."""
+        text = str(text or "").strip()
+        if not text:
+                return {"success": False, "error": "Message is empty."}, 400
+
+        state = chat.window_state(number)
+        if not state["open"]:
+                return {
+                        "success": False,
+                        "error": "The 24-hour reply window has closed. The customer must message "
+                                 "you again, or send an approved template.",
+                }, 200
+
+        ok, error, wamid = send_whatsapp_text(number, text)
+        if not ok:
+                return {"success": False, "error": error}, 200
+
+        chat.save_message(wamid, number, "out", text, status="sent")
+        return {"success": True}, 200
 
 
 def send_whatsapp_quote(row, kind="quote"):
@@ -2267,6 +2462,17 @@ class AppHandler(BaseHTTPRequestHandler):
                         self.send_redirect("/admin/users")
                         return
 
+                if self.path.startswith("/api/chat/") and self.path.endswith("/send"):
+                        number = self.path[len("/api/chat/"):-len("/send")]
+                        try:
+                                length = int(self.headers.get("Content-Length", "0"))
+                                data = json.loads(self.rfile.read(length).decode("utf-8"))
+                        except (ValueError, OSError):
+                                data = {}
+                        payload, status_code = send_chat_reply(number, data.get("message"))
+                        self.send_json_response(status_code, payload)
+                        return
+
                 send_link_action = get_send_link_api_action(self.path)
                 if send_link_action is not None:
                         kind, action = send_link_action
@@ -2413,6 +2619,12 @@ class AppHandler(BaseHTTPRequestHandler):
                         self.send_header("Content-Length", str(len(data)))
                         self.end_headers()
                         self.wfile.write(data)
+                        return
+
+                if parsed.path.startswith("/api/chat/"):
+                        number = parsed.path[len("/api/chat/"):]
+                        payload, status_code = get_chat_thread(number)
+                        self.send_json_response(status_code, payload)
                         return
 
                 send_link_action = get_send_link_api_action(parsed.path)

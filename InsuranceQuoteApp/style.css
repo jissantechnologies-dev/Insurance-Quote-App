@@ -1160,3 +1160,93 @@ pre {
 .auth-legal-links a {
     color: var(--muted);
 }
+
+/* --- WhatsApp chat drawer ------------------------------------------- */
+.chat-box {
+    width: min(520px, 94vw);
+    text-align: left;
+}
+
+.chat-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.chat-thread {
+    max-height: 46vh;
+    overflow-y: auto;
+    margin: 12px 0;
+    padding: 10px;
+    background: rgba(0, 0, 0, 0.03);
+    border-radius: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.chat-msg {
+    max-width: 78%;
+    padding: 8px 10px;
+    border-radius: 12px;
+    font-size: 0.9rem;
+}
+
+.chat-in {
+    align-self: flex-start;
+    background: #ffffff;
+    border: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+.chat-out {
+    align-self: flex-end;
+    background: #d9fdd3;
+}
+
+.chat-body {
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.chat-meta {
+    margin-top: 4px;
+    font-size: 0.72rem;
+    color: var(--muted);
+    text-align: right;
+}
+
+.chat-empty {
+    color: var(--muted);
+    text-align: center;
+    margin: 16px 0;
+}
+
+.chat-window-note {
+    font-size: 0.8rem;
+    color: #b23c17;
+    margin: 0 0 8px;
+}
+
+.chat-window-note.is-open {
+    color: var(--muted);
+}
+
+.chat-composer {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+}
+
+.chat-composer textarea {
+    flex: 1;
+    resize: vertical;
+    padding: 8px 10px;
+    border-radius: 10px;
+    border: 1px solid rgba(0, 0, 0, 0.15);
+    font: inherit;
+}
+
+.chat-composer textarea:disabled {
+    background: rgba(0, 0, 0, 0.05);
+}

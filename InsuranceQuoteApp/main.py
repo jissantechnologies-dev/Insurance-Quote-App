@@ -14,6 +14,8 @@ from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote_plus, urlparse
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 try:
         from openpyxl import load_workbook
@@ -91,6 +93,25 @@ SEND_LINK_KINDS = {
 }
 SEND_LINK_SENT_PATHS = {kind: BASE_DIR / f"sent_{kind}.json" for kind in SEND_LINK_KINDS}
 SEND_LINK_BATCH_PATHS = {kind: BASE_DIR / f"batch_{kind}.json" for kind in SEND_LINK_KINDS}
+
+# --- WhatsApp Cloud API ----------------------------------------------------
+# Set these in cPanel -> Setup Python App -> Environment variables. When
+# GI_WA_TOKEN and GI_WA_PHONE_NUMBER_ID are both present the app sends through
+# Meta's servers; otherwise it falls back to the old pywhatkit browser
+# automation, which only works on a desktop with WhatsApp Web logged in.
+WA_GRAPH_VERSION = os.environ.get("GI_WA_GRAPH_VERSION", "v23.0")
+WA_TOKEN = os.environ.get("GI_WA_TOKEN", "")
+WA_PHONE_NUMBER_ID = os.environ.get("GI_WA_PHONE_NUMBER_ID", "")
+WA_TEMPLATE_LANGUAGE = os.environ.get("GI_WA_TEMPLATE_LANGUAGE", "en")
+WA_TEMPLATE_NAMES = {
+        "quote": os.environ.get("GI_WA_TEMPLATE_QUOTE", "quote_share"),
+        "payment": os.environ.get("GI_WA_TEMPLATE_PAYMENT", "payment_link_share"),
+}
+
+
+def cloud_api_configured():
+        return bool(WA_TOKEN and WA_PHONE_NUMBER_ID)
+
 
 
 def load_json_list(path):
@@ -890,7 +911,12 @@ def build_send_quote_content(kind="quote"):
                 '</label>'
                 '<span id="sendQuoteImportStatus" class="import-status"></span>'
                 '</div>'
-                '<p class="sender-note">Messages are sent from the WhatsApp account logged in on this device. Make sure you are logged in to WhatsApp (or WhatsApp Web) with the business number before sending.</p>'
+                + (
+                        '<p class="sender-note">Messages are sent from the Gravity Insurance business number through the WhatsApp Cloud API. Nothing needs to be open on this device.</p>'
+                        if cloud_api_configured() else
+                        '<p class="sender-note">Messages are sent from the WhatsApp account logged in on this device. Make sure you are logged in to WhatsApp (or WhatsApp Web) with the business number before sending.</p>'
+                )
+                +
                 '<div id="sendQuoteImportError" class="form-error is-hidden"></div>'
                 '</div>'
                 '<div class="card">'
@@ -1420,10 +1446,73 @@ def build_send_quote_message(row, kind="quote"):
         )
 
 
+def build_template_parameters(row):
+        """Ordered {{1}}..{{4}} values for the quote / payment link templates.
+
+        WhatsApp rejects parameters containing newlines or tabs, so each value
+        is flattened to a single line."""
+        values = (
+                row["name"],
+                row["vehicleNumber"],
+                row["expiryDate"],
+                row["quoteLink"],
+        )
+        return [
+                {"type": "text", "text": " ".join(str(value or "").split())}
+                for value in values
+        ]
+
+
+def send_whatsapp_cloud_api(row, kind="quote"):
+        """Send one template message through Meta's WhatsApp Cloud API.
+
+        Returns (ok, error_message)."""
+        payload = {
+                "messaging_product": "whatsapp",
+                "to": row["mobileNumber"],
+                "type": "template",
+                "template": {
+                        "name": WA_TEMPLATE_NAMES[kind],
+                        "language": {"code": WA_TEMPLATE_LANGUAGE},
+                        "components": [
+                                {"type": "body", "parameters": build_template_parameters(row)}
+                        ],
+                },
+        }
+        request = Request(
+                f"https://graph.facebook.com/{WA_GRAPH_VERSION}/{WA_PHONE_NUMBER_ID}/messages",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                        "Authorization": f"Bearer {WA_TOKEN}",
+                        "Content-Type": "application/json",
+                },
+                method="POST",
+        )
+        try:
+                with urlopen(request, timeout=30) as response:
+                        json.loads(response.read().decode("utf-8"))
+                return True, ""
+        except HTTPError as exc:
+                # Meta puts the useful reason in the response body, not the status.
+                try:
+                        detail = json.loads(exc.read().decode("utf-8"))
+                        error = detail.get("error", {})
+                        message = error.get("error_user_msg") or error.get("message") or str(exc)
+                except Exception:
+                        message = f"WhatsApp API returned HTTP {exc.code}."
+                return False, message
+        except (URLError, OSError) as exc:
+                return False, f"Could not reach the WhatsApp API: {exc}"
+
+
 def send_whatsapp_quote(row, kind="quote"):
-        """Send the quote/payment link via WhatsApp Web automation.
+        """Send the quote/payment link, preferring the Cloud API.
 
         Returns (ok, error_message, automation_available)."""
+        if cloud_api_configured():
+                ok, error = send_whatsapp_cloud_api(row, kind)
+                return ok, error, True
+
         try:
                 import pywhatkit
         except Exception as exc:

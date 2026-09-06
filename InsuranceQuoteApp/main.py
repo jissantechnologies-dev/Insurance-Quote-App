@@ -1581,6 +1581,28 @@ def build_template_parameters(row):
         ]
 
 
+def describe_wa_error(exc):
+        """Turn a Graph API HTTPError into a message that names the numeric code.
+
+        Meta's prose ("API access blocked.") is shared by several unrelated
+        restrictions, so the code is what actually identifies the problem."""
+        try:
+                detail = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+                return f"WhatsApp API returned HTTP {exc.code}."
+
+        error = detail.get("error", {})
+        message = error.get("error_user_msg") or error.get("message") or str(exc)
+        details = (error.get("error_data") or {}).get("details")
+        if details and details != message:
+                message = f"{message} {details}"
+
+        codes = [str(part) for part in (error.get("code"), error.get("error_subcode")) if part]
+        if codes:
+                message = f"{message} (code {'/'.join(codes)})"
+        return message
+
+
 def send_whatsapp_cloud_api(row, kind="quote"):
         """Send one template message through Meta's WhatsApp Cloud API.
 
@@ -1617,13 +1639,7 @@ def send_whatsapp_cloud_api(row, kind="quote"):
                 return True, ""
         except HTTPError as exc:
                 # Meta puts the useful reason in the response body, not the status.
-                try:
-                        detail = json.loads(exc.read().decode("utf-8"))
-                        error = detail.get("error", {})
-                        message = error.get("error_user_msg") or error.get("message") or str(exc)
-                except Exception:
-                        message = f"WhatsApp API returned HTTP {exc.code}."
-                return False, message
+                return False, describe_wa_error(exc)
         except (URLError, OSError) as exc:
                 return False, f"Could not reach the WhatsApp API: {exc}"
 
@@ -1658,13 +1674,7 @@ def send_whatsapp_text(number, text):
                 wamid = (body.get("messages") or [{}])[0].get("id", "")
                 return True, "", wamid
         except HTTPError as exc:
-                try:
-                        detail = json.loads(exc.read().decode("utf-8"))
-                        error = detail.get("error", {})
-                        message = error.get("error_user_msg") or error.get("message") or str(exc)
-                except Exception:
-                        message = f"WhatsApp API returned HTTP {exc.code}."
-                return False, message, ""
+                return False, describe_wa_error(exc), ""
         except (URLError, OSError) as exc:
                 return False, f"Could not reach the WhatsApp API: {exc}", ""
 

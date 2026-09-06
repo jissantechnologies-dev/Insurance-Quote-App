@@ -19,18 +19,32 @@ DB_PATH = BASE_DIR / "reminders.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sent_reminders (
-        reminder_key TEXT NOT NULL,
-        days_before  INTEGER NOT NULL,
-        sent_at      INTEGER NOT NULL,
+        reminder_key  TEXT NOT NULL,
+        days_before   INTEGER NOT NULL,
+        sent_at       INTEGER NOT NULL,
+        name          TEXT NOT NULL DEFAULT '',
+        policy_number TEXT NOT NULL DEFAULT '',
+        number        TEXT NOT NULL DEFAULT '',
+        expiry_text   TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (reminder_key, days_before)
 );
 """
+
+# Columns added after the first version shipped; existing rows keep their
+# defaults rather than forcing the log to be thrown away.
+LATER_COLUMNS = ("name", "policy_number", "number", "expiry_text")
 
 
 def connect():
         connection = sqlite3.connect(DB_PATH, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.executescript(SCHEMA)
+        existing = {row["name"] for row in connection.execute("PRAGMA table_info(sent_reminders)")}
+        for column in LATER_COLUMNS:
+                if column not in existing:
+                        connection.execute(
+                                f"ALTER TABLE sent_reminders ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                        )
         return connection
 
 
@@ -54,13 +68,34 @@ def already_sent(key, days_before):
         return row is not None
 
 
-def mark_sent(key, days_before):
+def mark_sent(key, days_before, details=None):
+        details = details or {}
         with connect() as connection:
                 connection.execute(
                         "INSERT OR IGNORE INTO sent_reminders"
-                        " (reminder_key, days_before, sent_at) VALUES (?, ?, ?)",
-                        (key, int(days_before), int(time.time())),
+                        " (reminder_key, days_before, sent_at, name, policy_number,"
+                        "  number, expiry_text) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                                key,
+                                int(days_before),
+                                int(time.time()),
+                                str(details.get("name", "")),
+                                str(details.get("policyNumber", "")),
+                                str(details.get("mobileNumber", "")),
+                                str(details.get("expiryText", "")),
+                        ),
                 )
+
+
+def recent(limit=50):
+        """Most recently sent reminders, newest first."""
+        with connect() as connection:
+                rows = connection.execute(
+                        "SELECT * FROM sent_reminders ORDER BY sent_at DESC, rowid DESC"
+                        " LIMIT ?",
+                        (int(limit),),
+                ).fetchall()
+        return [dict(row) for row in rows]
 
 
 def forget(key):

@@ -1858,7 +1858,7 @@ def send_expiry_reminders(today=None, dry_run=False):
                                 ),
                                 status="sent",
                         )
-                        reminders.mark_sent(key, item["daysLeft"])
+                        reminders.mark_sent(key, item["daysLeft"], item)
                         summary["sent"] += 1
                 else:
                         summary["failed"] += 1
@@ -2245,6 +2245,45 @@ def build_send_quote_rows(raw_rows, column_keys, kind="quote"):
                 )
 
         return result_rows
+
+
+def render_reminder_history_rows(limit=50):
+        """Rows for the automatic-reminder log below the Expiry Alerts table."""
+        rows = []
+        for entry in reminders.recent(limit):
+                # Rows written before the log carried display fields show the
+                # key rather than a blank line.
+                name = entry.get("name") or entry.get("reminder_key", "")
+                number = entry.get("number", "")
+                rows.append(
+                        "<tr>"
+                        f"<td>{escape(str(name))}</td>"
+                        f"<td>{escape(str(number))}</td>"
+                        f"<td>{escape(str(entry.get('policy_number', '')))}</td>"
+                        f"<td>{escape(str(entry.get('expiry_text', '')))}</td>"
+                        f"<td>{escape(str(entry.get('days_before', '')))} days before</td>"
+                        f"<td>{escape(chat.format_time(entry.get('sent_at', 0)))}</td>"
+                        "</tr>"
+                )
+        return rows
+
+
+def build_reminder_history_card():
+        rows = render_reminder_history_rows()
+        if not rows:
+                body = (
+                        '<p class="chat-empty">No automatic reminders have been sent yet. '
+                        'They go out daily at 30, 15, 7, 3 and 1 days before expiry.</p>'
+                )
+        else:
+                body = (
+                        '<div class="table-scroll"><table>'
+                        '<thead><tr><th>Name</th><th>Mobile Number</th><th>Policy Number</th>'
+                        '<th>Expiry Date</th><th>Reminder</th><th>Sent Date/Time</th></tr></thead>'
+                        f'<tbody>{"".join(rows)}</tbody>'
+                        '</table></div>'
+                )
+        return '<div class="card"><h2>Reminders Sent</h2>' + body + '</div>'
 
 
 def render_expiry_alert_rows(customers, today):
@@ -3216,6 +3255,7 @@ def render_page(current_path, query_params, user=None):
                 '<thead><tr><th>Name</th><th>Policy Number</th><th>Expiry Date</th><th>Days Left</th><th>Action</th></tr></thead>'
                 f'<tbody>{reminder_rows}</tbody>'
                 '</table></div>'
+                + build_reminder_history_card()
         )
 
         page_content = dashboard_content

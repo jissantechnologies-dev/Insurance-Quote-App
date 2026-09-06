@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS messages (
         type        TEXT NOT NULL DEFAULT 'text',
         body        TEXT NOT NULL DEFAULT '',
         media_id    TEXT,
+        local_path  TEXT NOT NULL DEFAULT '',
+        filed_as    TEXT NOT NULL DEFAULT '',
         status      TEXT NOT NULL DEFAULT '',
         error       TEXT NOT NULL DEFAULT '',
         timestamp   INTEGER NOT NULL
@@ -53,6 +55,13 @@ def connect():
         # readers from blocking on the writer.
         connection.execute("PRAGMA journal_mode=WAL")
         connection.executescript(SCHEMA)
+        # Databases created before inbound media was stored lack these columns.
+        existing = {row["name"] for row in connection.execute("PRAGMA table_info(messages)")}
+        for column in ("local_path", "filed_as"):
+                if column not in existing:
+                        connection.execute(
+                                f"ALTER TABLE messages ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                        )
         return connection
 
 
@@ -114,7 +123,14 @@ def describe_message(message):
 
 
 def record_webhook(payload):
-        """Store inbound messages and delivery receipts from one webhook POST."""
+        """Store inbound messages and delivery receipts from one webhook POST.
+
+        Returns the inbound media that still needs fetching, as a list of
+        {wamid, number, media_id, type}. Meta deletes inbound media after 30
+        days, so the caller must download it promptly - but downloading here
+        would make the webhook slow and drag main.py into this module, so the
+        work is handed back to app.py instead."""
+        pending = []
         for entry in payload.get("entry", []) or []:
                 for change in entry.get("changes", []) or []:
                         value = change.get("value", {}) or {}
@@ -131,6 +147,13 @@ def record_webhook(payload):
                                         status="received",
                                         timestamp=message.get("timestamp"),
                                 )
+                                if media_id:
+                                        pending.append({
+                                                "wamid": message.get("id"),
+                                                "number": message.get("from"),
+                                                "media_id": media_id,
+                                                "type": msg_type,
+                                        })
 
                         for status in value.get("statuses", []) or []:
                                 errors = status.get("errors") or []
@@ -139,6 +162,33 @@ def record_webhook(payload):
                                         status.get("status", ""),
                                         errors[0].get("title", "") if errors else "",
                                 )
+        return pending
+
+
+def set_media_file(wamid, local_path):
+        """Record where an inbound attachment was saved on disk."""
+        with connect() as connection:
+                connection.execute(
+                        "UPDATE messages SET local_path = ? WHERE wamid = ?",
+                        (str(local_path or ""), wamid),
+                )
+
+
+def set_filed_as(wamid, doc_label):
+        """Note that an attachment was filed into a customer's documents."""
+        with connect() as connection:
+                connection.execute(
+                        "UPDATE messages SET filed_as = ? WHERE wamid = ?",
+                        (str(doc_label or ""), wamid),
+                )
+
+
+def get_message(wamid):
+        with connect() as connection:
+                row = connection.execute(
+                        "SELECT * FROM messages WHERE wamid = ?", (wamid,)
+                ).fetchone()
+        return dict(row) if row else None
 
 
 def last_inbound_timestamp(number):
@@ -185,6 +235,8 @@ def get_thread(number, limit=200):
                         "status": row["status"],
                         "error": row["error"],
                         "at": format_time(row["timestamp"]),
+                        "mediaUrl": f"/chat-media/{row['wamid']}" if row["local_path"] else "",
+                        "filedAs": row["filed_as"],
                 }
                 for row in rows
         ]

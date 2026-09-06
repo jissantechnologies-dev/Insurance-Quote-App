@@ -1250,3 +1250,46 @@ pre {
 .chat-composer textarea:disabled {
     background: rgba(0, 0, 0, 0.05);
 }
+
+.chat-media {
+    display: block;
+    max-width: 200px;
+    max-height: 200px;
+    border-radius: 8px;
+    margin-top: 6px;
+}
+
+.chat-media-link {
+    display: inline-block;
+    margin-top: 6px;
+    font-size: 0.85rem;
+}
+
+.chat-filed {
+    font-size: 0.75rem;
+    color: var(--muted);
+    margin-top: 4px;
+}
+
+.chat-filed.chat-unfiled {
+    color: #b23c17;
+}
+
+.chat-file-picker {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 6px;
+}
+
+.chat-file-select {
+    flex: 1 1 140px;
+    font-size: 0.75rem;
+    padding: 4px;
+}
+
+.chat-file-btn {
+    font-size: 0.75rem;
+    padding: 4px 10px;
+    cursor: pointer;
+}

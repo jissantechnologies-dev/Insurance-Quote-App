@@ -35,3 +35,8 @@ whatsapp_webhook.log
 InsuranceQuoteApp/messages.db
 InsuranceQuoteApp/messages.db-wal
 InsuranceQuoteApp/messages.db-shm
+
+# Inbound WhatsApp attachments - customer ID documents, downloaded from Meta
+# when the webhook fires. Never commit: personal data, and the live server's
+# copies are the real ones.
+InsuranceQuoteApp/chat_media/

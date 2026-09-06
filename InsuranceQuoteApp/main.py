@@ -32,6 +32,7 @@ NEW_CUSTOMERS_EXCEL_PATH = BASE_DIR / "newcustomer.xlsx"
 ALLOWED_PAGE_PATHS = {"/", "/leads", "/active-clients", "/expiry-alerts", "/send-quote", "/send-payment-link"}
 
 DOCUMENTS_DIR = BASE_DIR / "documents"
+CHAT_MEDIA_DIR = BASE_DIR / "chat_media"
 DOCUMENT_TYPES = [
         ("rc_book", "RC Book"),
         ("previous_policy", "Previous Policy Copy"),
@@ -1057,7 +1058,7 @@ SEND_QUOTE_SCRIPT = r"""
         var chatSendBtn = document.getElementById("chatSendBtn");
         var chatWindowNote = document.getElementById("chatWindowNote");
         var closeChatBtn = document.getElementById("closeChatBtn");
-        var chatState = { number: "", timer: null };
+        var chatState = { number: "", timer: null, targets: [] };
 
         function describeWindow(win) {
                 if (!win.lastInboundAt) {
@@ -1073,7 +1074,41 @@ SEND_QUOTE_SCRIPT = r"""
                 return "You can reply freely for another " + hours + "h " + minutes + "m.";
         }
 
+        function renderAttachment(m) {
+                if (!m.mediaUrl) return "";
+                var url = escapeHtml(m.mediaUrl);
+                var preview = m.type === "image"
+                        ? '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' +
+                          '<img class="chat-media" src="' + url + '" alt="Attachment" /></a>'
+                        : '<a class="chat-media-link" href="' + url + '" target="_blank" ' +
+                          'rel="noopener noreferrer">Open attachment</a>';
+
+                if (m.filedAs) {
+                        return preview + '<div class="chat-filed">Filed as ' +
+                                escapeHtml(m.filedAs) + "</div>";
+                }
+                if (!chatState.targets.length) {
+                        return preview + '<div class="chat-filed chat-unfiled">' +
+                                "No matching active client - file it from the client page." + "</div>";
+                }
+                return preview + '<div class="chat-file-picker" data-wamid="' +
+                        escapeHtml(m.id) + '">' + buildTargetOptions() +
+                        '<button type="button" class="chat-file-btn">Save to documents</button></div>';
+        }
+
+        function buildTargetOptions() {
+                var options = chatState.targets.map(function (t, ti) {
+                        return t.documents.map(function (d, di) {
+                                var label = t.name + " - " + d.label + (d.filled ? " (replace)" : "");
+                                return '<option value="' + ti + ":" + di + '">' +
+                                        escapeHtml(label) + "</option>";
+                        }).join("");
+                }).join("");
+                return '<select class="chat-file-select">' + options + "</select>";
+        }
+
         function renderChat(data) {
+                chatState.targets = data.targets || [];
                 if (!data.messages.length) {
                         chatThread.innerHTML = '<p class="chat-empty">No messages yet.</p>';
                 } else {
@@ -1083,7 +1118,8 @@ SEND_QUOTE_SCRIPT = r"""
                                 if (m.direction === "out" && m.status) meta += " &middot; " + escapeHtml(m.status);
                                 if (m.error) meta += " &middot; " + escapeHtml(m.error);
                                 return '<div class="' + cls + '"><div class="chat-body">' +
-                                        escapeHtml(m.body) + '</div><div class="chat-meta">' + meta + "</div></div>";
+                                        escapeHtml(m.body) + renderAttachment(m) +
+                                        '</div><div class="chat-meta">' + meta + "</div></div>";
                         }).join("");
                         chatThread.scrollTop = chatThread.scrollHeight;
                 }
@@ -1120,6 +1156,44 @@ SEND_QUOTE_SCRIPT = r"""
                 var button = event.target.closest(".chat-btn");
                 if (!button) return;
                 openChat(button.getAttribute("data-number"), button.getAttribute("data-name"));
+        });
+
+        chatThread.addEventListener("click", function (event) {
+                var button = event.target.closest(".chat-file-btn");
+                if (!button) return;
+                var picker = button.closest(".chat-file-picker");
+                var choice = picker.querySelector(".chat-file-select").value.split(":");
+                var target = chatState.targets[Number(choice[0])];
+                var doc = target.documents[Number(choice[1])];
+                if (doc.filled &&
+                        !window.confirm("Replace the existing " + doc.label + " for " + target.name + "?")) {
+                        return;
+                }
+
+                button.disabled = true;
+                fetch("/api/chat/attachment/" + encodeURIComponent(picker.getAttribute("data-wamid")) + "/file", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                                source: target.source,
+                                index: target.index,
+                                docType: doc.type
+                        })
+                })
+                        .then(function (r) { return r.json(); })
+                        .then(function (result) {
+                                if (result.success) {
+                                        showToast("success", "Saved as " + result.filedAs + ".");
+                                        loadChat();
+                                } else {
+                                        showToast("error", result.error || "Could not save the document.");
+                                        button.disabled = false;
+                                }
+                        })
+                        .catch(function () {
+                                showToast("error", "Could not reach the server.");
+                                button.disabled = false;
+                        });
         });
 
         closeChatBtn.addEventListener("click", closeChat);
@@ -1679,11 +1753,168 @@ def send_whatsapp_text(number, text):
                 return False, f"Could not reach the WhatsApp API: {exc}", ""
 
 
+# --- inbound WhatsApp attachments -----------------------------------------
+
+# Meta serves media from a short-lived URL and deletes it after 30 days, so an
+# attachment is downloaded as soon as its webhook arrives rather than on demand.
+
+MEDIA_EXTENSIONS = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "application/pdf": ".pdf",
+}
+
+
+def download_whatsapp_media(media_id):
+        """Fetch one inbound attachment. Returns (bytes, extension) or (None, "")."""
+        if not cloud_api_configured():
+                return None, ""
+        headers = {"Authorization": f"Bearer {WA_TOKEN}"}
+        try:
+                lookup = Request(
+                        f"https://graph.facebook.com/{WA_GRAPH_VERSION}/{media_id}",
+                        headers=headers,
+                )
+                with urlopen(lookup, timeout=30) as response:
+                        meta = json.loads(response.read().decode("utf-8"))
+                url = meta.get("url")
+                if not url:
+                        return None, ""
+
+                # The media URL sits on a lookaside host but still needs the token.
+                with urlopen(Request(url, headers=headers), timeout=60) as response:
+                        payload = response.read()
+                        mime = (response.headers.get("Content-Type") or "").split(";")[0].strip()
+        except (HTTPError, URLError, OSError, ValueError):
+                return None, ""
+
+        extension = MEDIA_EXTENSIONS.get(mime) or mimetypes.guess_extension(mime) or ".bin"
+        return payload, extension
+
+
+def find_active_clients_by_number(number):
+        """Active clients whose mobile number matches, across both stores.
+
+        Returns a list of (source, index, customer)."""
+        target = chat.normalize_number(number)
+        matches = []
+        for source, customers in (
+                ("active_json", load_customers()),
+                ("active_xl", load_new_customers_from_excel()),
+        ):
+                for index, customer in enumerate(customers):
+                        raw = get_customer_value(customer, "mobileNumber", "phoneNumber", "phone")
+                        if raw and chat.normalize_number(raw) == target:
+                                matches.append((source, index, customer))
+        return matches
+
+
+def auto_file_attachment(number, filename, file_bytes):
+        """File an attachment only when the destination is unambiguous.
+
+        Two conditions must hold: the number matches exactly one active client,
+        and exactly one of that client's document slots is still empty. The
+        message never says whether a photo is an Aadhaar or an RC book, so a
+        single empty slot is the only case with one possible answer - and
+        save_customer_document overwrites, so guessing would destroy a file.
+        Returns the document label it was filed as, or "".
+        """
+        matches = find_active_clients_by_number(number)
+        if len(matches) != 1:
+                return ""
+
+        source, index, _ = matches[0]
+        doc_id = get_or_create_doc_id(source, index)
+        if not doc_id:
+                return ""
+
+        existing = list_customer_documents(doc_id)
+        empty = [(key, label) for key, label in DOCUMENT_TYPES if key not in existing]
+        if len(empty) != 1:
+                return ""
+
+        doc_type, doc_label = empty[0]
+        if not save_customer_document(doc_id, doc_type, filename, file_bytes):
+                return ""
+        return doc_label
+
+
+def ingest_inbound_media(item):
+        """Download one inbound attachment, store it, and auto-file if possible."""
+        wamid = item.get("wamid")
+        payload, extension = download_whatsapp_media(item.get("media_id"))
+        if not wamid or not payload:
+                return
+
+        CHAT_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", str(wamid))
+        path = CHAT_MEDIA_DIR / f"{safe_name}{extension}"
+        path.write_bytes(payload)
+        chat.set_media_file(wamid, path.name)
+
+        label = auto_file_attachment(item.get("number"), f"file{extension}", payload)
+        if label:
+                chat.set_filed_as(wamid, label)
+
+
+def get_chat_media_path(wamid):
+        """Local file for one inbound attachment, or None."""
+        message = chat.get_message(wamid)
+        if not message or not message.get("local_path"):
+                return None
+        path = CHAT_MEDIA_DIR / Path(str(message["local_path"])).name
+        return path if path.is_file() else None
+
+
+def file_attachment_manually(wamid, source, index, doc_type):
+        """File an attachment the operator picked a slot for."""
+        path = get_chat_media_path(wamid)
+        if path is None:
+                return {"success": False, "error": "That attachment is no longer stored."}, 404
+        if doc_type not in DOCUMENT_TYPE_KEYS:
+                return {"success": False, "error": "Unknown document type."}, 400
+
+        try:
+                index = int(index)
+        except (TypeError, ValueError):
+                return {"success": False, "error": "Could not find that customer."}, 400
+
+        doc_id = get_or_create_doc_id(source, index)
+        if not doc_id:
+                return {"success": False, "error": "Could not find that customer."}, 404
+        if not save_customer_document(doc_id, doc_type, path.name, path.read_bytes()):
+                return {"success": False, "error": "Could not save the document."}, 500
+
+        label = dict(DOCUMENT_TYPES)[doc_type]
+        chat.set_filed_as(wamid, label)
+        return {"success": True, "filedAs": label}, 200
+
+
+def get_chat_media_targets(number):
+        """Filing choices for the chat drawer: matching clients and their slots."""
+        targets = []
+        for source, index, customer in find_active_clients_by_number(number):
+                doc_id = str(get_customer_value(customer, "docId")).strip()
+                existing = list_customer_documents(doc_id) if doc_id else {}
+                targets.append({
+                        "source": source,
+                        "index": index,
+                        "name": str(get_customer_value(customer, "name")),
+                        "documents": [
+                                {"type": key, "label": label, "filled": key in existing}
+                                for key, label in DOCUMENT_TYPES
+                        ],
+                })
+        return targets
+
+
 def get_chat_thread(number):
         payload = {
                 "messages": chat.get_thread(number),
                 "window": chat.window_state(number),
                 "configured": cloud_api_configured(),
+                "targets": get_chat_media_targets(number),
         }
         return payload, 200
 
@@ -2472,6 +2703,19 @@ class AppHandler(BaseHTTPRequestHandler):
                         self.send_redirect("/admin/users")
                         return
 
+                if self.path.startswith("/api/chat/attachment/") and self.path.endswith("/file"):
+                        wamid = self.path[len("/api/chat/attachment/"):-len("/file")]
+                        try:
+                                length = int(self.headers.get("Content-Length", "0"))
+                                data = json.loads(self.rfile.read(length).decode("utf-8"))
+                        except (ValueError, OSError):
+                                data = {}
+                        payload, status_code = file_attachment_manually(
+                                wamid, data.get("source"), data.get("index"), data.get("docType")
+                        )
+                        self.send_json_response(status_code, payload)
+                        return
+
                 if self.path.startswith("/api/chat/") and self.path.endswith("/send"):
                         number = self.path[len("/api/chat/"):-len("/send")]
                         try:
@@ -2624,6 +2868,20 @@ class AppHandler(BaseHTTPRequestHandler):
                                 return
                         content_type = mimetypes.guess_type(doc_path.name)[0] or "application/octet-stream"
                         data = doc_path.read_bytes()
+                        self.send_response(200)
+                        self.send_header("Content-type", content_type)
+                        self.send_header("Content-Length", str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data)
+                        return
+
+                if parsed.path.startswith("/chat-media/"):
+                        media_path = get_chat_media_path(parsed.path[len("/chat-media/"):])
+                        if media_path is None:
+                                self.send_error(404, "Attachment not found")
+                                return
+                        content_type = mimetypes.guess_type(media_path.name)[0] or "application/octet-stream"
+                        data = media_path.read_bytes()
                         self.send_response(200)
                         self.send_header("Content-type", content_type)
                         self.send_header("Content-Length", str(len(data)))

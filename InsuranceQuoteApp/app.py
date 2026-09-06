@@ -13,7 +13,7 @@ import os
 import traceback
 from urllib.parse import quote_plus
 
-from flask import Flask, Response, jsonify, redirect, request, send_file
+from flask import Flask, Response, abort, jsonify, redirect, request, send_file
 
 import auth
 import chat
@@ -280,11 +280,20 @@ def whatsapp_webhook_receive():
         payload to a log for troubleshooting.
         """
         payload = request.get_json(silent=True) or {}
+        pending = []
         try:
-                chat.record_webhook(payload)
+                pending = chat.record_webhook(payload) or []
         except Exception:
                 # Never let a storage failure turn into a retry storm from Meta.
                 traceback.print_exc()
+
+        for item in pending:
+                try:
+                        core.ingest_inbound_media(item)
+                except Exception:
+                        # An attachment we could not fetch still leaves the message
+                        # itself readable, so log and carry on.
+                        traceback.print_exc()
         try:
                 with open(WA_LOG_PATH, "a", encoding="utf-8") as handle:
                         json.dump(payload, handle, ensure_ascii=False)
@@ -292,6 +301,23 @@ def whatsapp_webhook_receive():
         except OSError:
                 pass
         return Response("EVENT_RECEIVED", status=200, mimetype="text/plain")
+
+
+@app.get("/chat-media/<wamid>")
+def chat_media(wamid):
+        media_path = core.get_chat_media_path(wamid)
+        if media_path is None:
+                abort(404)
+        return send_file(media_path, as_attachment=False, download_name=media_path.name)
+
+
+@app.post("/api/chat/attachment/<wamid>/file")
+def file_chat_attachment(wamid):
+        data = request.get_json(silent=True) or {}
+        payload, status_code = core.file_attachment_manually(
+                wamid, data.get("source"), data.get("index"), data.get("docType")
+        )
+        return jsonify(payload), status_code
 
 
 @app.get("/api/chat/<number>")

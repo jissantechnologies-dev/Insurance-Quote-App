@@ -57,6 +57,7 @@ IST = ZoneInfo("Asia/Kolkata")
 import auth
 import chat
 import legal
+import reminders
 
 SEND_QUOTE_BASE_COLUMNS = [
         ("name", "Name", ("name", "customer name")),
@@ -109,6 +110,11 @@ WA_TEMPLATE_NAMES = {
         "quote": os.environ.get("GI_WA_TEMPLATE_QUOTE", "quote_share"),
         "payment": os.environ.get("GI_WA_TEMPLATE_PAYMENT", "payment_link_share"),
 }
+WA_TEMPLATE_REMINDER = os.environ.get("GI_WA_TEMPLATE_REMINDER", "policy_expiry_reminder")
+
+# How many days before expiry a renewal reminder goes out. Each policy gets at
+# most one message per milestone - reminders.py records what has been sent.
+REMINDER_DAYS = (30, 15, 7, 3, 1)
 
 
 def cloud_api_configured():
@@ -1716,6 +1722,150 @@ def send_whatsapp_cloud_api(row, kind="quote"):
                 return False, describe_wa_error(exc)
         except (URLError, OSError) as exc:
                 return False, f"Could not reach the WhatsApp API: {exc}"
+
+
+def get_today():
+        """Today in India, regardless of how the host's clock is set."""
+        return datetime.now(IST).date()
+
+
+def send_template_message(number, template_name, values):
+        """Send any approved template with ordered body parameters.
+
+        Returns (ok, error_message, wamid). WhatsApp rejects parameters
+        containing newlines or tabs, so each value is flattened first."""
+        if not cloud_api_configured():
+                return False, "WhatsApp Cloud API is not configured on this server.", ""
+
+        number = chat.normalize_number(number)
+        if not number:
+                return False, "No mobile number.", ""
+
+        payload = {
+                "messaging_product": "whatsapp",
+                "to": number,
+                "type": "template",
+                "template": {
+                        "name": template_name,
+                        "language": {"code": WA_TEMPLATE_LANGUAGE},
+                        "components": [{
+                                "type": "body",
+                                "parameters": [
+                                        {"type": "text", "text": " ".join(str(v or "").split())}
+                                        for v in values
+                                ],
+                        }],
+                },
+        }
+        request = Request(
+                f"https://graph.facebook.com/{WA_GRAPH_VERSION}/{WA_PHONE_NUMBER_ID}/messages",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                        "Authorization": f"Bearer {WA_TOKEN}",
+                        "Content-Type": "application/json",
+                },
+                method="POST",
+        )
+        try:
+                with urlopen(request, timeout=30) as response:
+                        body = json.loads(response.read().decode("utf-8"))
+                return True, "", (body.get("messages") or [{}])[0].get("id", "")
+        except HTTPError as exc:
+                return False, describe_wa_error(exc), ""
+        except (URLError, OSError) as exc:
+                return False, f"Could not reach the WhatsApp API: {exc}", ""
+
+
+def build_reminder_text(name, policy_number, expiry_text):
+        """The wording the approved template must match, for the chat record."""
+        return (
+                f"Hello {name}, your insurance policy {policy_number} is expiring on "
+                f"{expiry_text}. Please renew your policy. - Gravity Insurance"
+        )
+
+
+def collect_expiring_customers(today):
+        """Every active client whose policy expires on a reminder milestone.
+
+        Returns dicts of the fields a reminder needs, plus the milestone that
+        triggered it so the send can be recorded against it."""
+        due = []
+        for customers in (load_customers(), load_new_customers_from_excel()):
+                for customer in customers:
+                        expiry_text = str(get_customer_value(
+                                customer, "policyExpiryDate", "PolicyExpiryDate"
+                        ))
+                        expiry_date = parse_policy_expiry(expiry_text)
+                        if not expiry_date:
+                                continue
+
+                        days_left = (expiry_date - today).days
+                        if days_left not in REMINDER_DAYS:
+                                continue
+
+                        mobile = chat.normalize_number(get_customer_value(
+                                customer, "mobileNumber", "phoneNumber", "phone"
+                        ))
+                        if not mobile:
+                                continue
+
+                        policy_number = str(get_customer_value(
+                                customer, "PolicyNumber", "policyNumber", "policy_number"
+                        ))
+                        due.append({
+                                "name": str(get_customer_value(customer, "name")) or "Customer",
+                                "policyNumber": policy_number,
+                                "expiryText": expiry_text,
+                                "mobileNumber": mobile,
+                                "daysLeft": days_left,
+                        })
+        return due
+
+
+def send_expiry_reminders(today=None, dry_run=False):
+        """Send one renewal reminder per policy per milestone.
+
+        Safe to run more than once a day: reminders.already_sent() keeps a
+        policy from being messaged twice for the same milestone.
+        Returns a summary dict."""
+        today = today or get_today()
+        summary = {"sent": 0, "skipped": 0, "failed": 0, "details": []}
+
+        for item in collect_expiring_customers(today):
+                key = reminders.reminder_key(item["mobileNumber"], item["policyNumber"])
+                if reminders.already_sent(key, item["daysLeft"]):
+                        summary["skipped"] += 1
+                        continue
+
+                if dry_run:
+                        summary["sent"] += 1
+                        summary["details"].append(
+                                f"would send to {item['name']} ({item['mobileNumber']}), "
+                                f"{item['daysLeft']}d"
+                        )
+                        continue
+
+                ok, error, wamid = send_template_message(
+                        item["mobileNumber"],
+                        WA_TEMPLATE_REMINDER,
+                        (item["name"], item["policyNumber"], item["expiryText"]),
+                )
+                if ok:
+                        chat.save_message(
+                                wamid, item["mobileNumber"], "out",
+                                build_reminder_text(
+                                        item["name"], item["policyNumber"], item["expiryText"]
+                                ),
+                                status="sent",
+                        )
+                        reminders.mark_sent(key, item["daysLeft"])
+                        summary["sent"] += 1
+                else:
+                        summary["failed"] += 1
+                        summary["details"].append(
+                                f"{item['name']} ({item['mobileNumber']}): {error}"
+                        )
+        return summary
 
 
 def send_whatsapp_text(number, text):

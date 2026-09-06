@@ -40,3 +40,7 @@ InsuranceQuoteApp/messages.db-shm
 # when the webhook fires. Never commit: personal data, and the live server's
 # copies are the real ones.
 InsuranceQuoteApp/chat_media/
+
+# Reminder send log - which policies have already been messaged.
+InsuranceQuoteApp/reminders.db
+InsuranceQuoteApp/reminders.log

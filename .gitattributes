@@ -1,0 +1,7 @@
+# Shell scripts must keep LF endings. Committed from Windows with
+# core.autocrlf=true they pick up CRLF, and the Linux host then fails the
+# shebang with "/bin/bash^M: bad interpreter" - the script never runs.
+*.sh text eol=lf
+
+# Same reasoning for anything else the server executes or parses line by line.
+.htaccess text eol=lf

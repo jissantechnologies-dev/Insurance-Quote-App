@@ -57,7 +57,10 @@ IST = ZoneInfo("Asia/Kolkata")
 import auth
 import chat
 import legal
+import quote_image
+import quotes
 import reminders
+import whatsapp_media
 
 SEND_QUOTE_BASE_COLUMNS = [
         ("name", "Name", ("name", "customer name")),
@@ -111,6 +114,16 @@ WA_TEMPLATE_NAMES = {
         "payment": os.environ.get("GI_WA_TEMPLATE_PAYMENT", "payment_link_share"),
 }
 WA_TEMPLATE_REMINDER = os.environ.get("GI_WA_TEMPLATE_REMINDER", "policy_expiry_reminder")
+
+# The quote PNG goes out on its own template - one with an IMAGE header, which
+# quote_share (text only) does not have, so this needs approving separately in
+# the WhatsApp Manager before the image send will work. Its body must read:
+#   Hello {{1}}, here is your motor insurance quote for vehicle {{2}}.
+#   Your renewal amount is Rs {{3}}. - Gravity Insurance
+WA_TEMPLATE_QUOTE_IMAGE = os.environ.get("GI_WA_TEMPLATE_QUOTE_IMAGE", "quote_image_share")
+
+# Printed along the bottom of the rendered quote.
+QUOTE_CONTACT_LINE = os.environ.get("GI_QUOTE_CONTACT", "")
 
 # How many days before expiry a renewal reminder goes out. Each policy gets at
 # most one message per milestone - reminders.py records what has been sent.
@@ -1661,26 +1674,9 @@ def build_template_parameters(row):
         ]
 
 
-def describe_wa_error(exc):
-        """Turn a Graph API HTTPError into a message that names the numeric code.
-
-        Meta's prose ("API access blocked.") is shared by several unrelated
-        restrictions, so the code is what actually identifies the problem."""
-        try:
-                detail = json.loads(exc.read().decode("utf-8"))
-        except Exception:
-                return f"WhatsApp API returned HTTP {exc.code}."
-
-        error = detail.get("error", {})
-        message = error.get("error_user_msg") or error.get("message") or str(exc)
-        details = (error.get("error_data") or {}).get("details")
-        if details and details != message:
-                message = f"{message} {details}"
-
-        codes = [str(part) for part in (error.get("code"), error.get("error_subcode")) if part]
-        if codes:
-                message = f"{message} (code {'/'.join(codes)})"
-        return message
+# Both the text sends here and the media sends in whatsapp_media need to report
+# Graph errors the same way, so the one implementation lives over there.
+describe_wa_error = whatsapp_media.describe_error
 
 
 def send_whatsapp_cloud_api(row, kind="quote"):
@@ -1774,6 +1770,81 @@ def send_template_message(number, template_name, values):
                 return False, describe_wa_error(exc), ""
         except (URLError, OSError) as exc:
                 return False, f"Could not reach the WhatsApp API: {exc}", ""
+
+
+def build_quote_image_caption(name, breakdown):
+        """The wording the image template must match, for the chat record.
+
+        The customer sees the PNG plus this text; the chat view only stores
+        text, so what is recorded here is what the agent will read back later."""
+        return (
+                f"Hello {name}, here is your motor insurance quote for vehicle "
+                f"{breakdown.inputs.vehicle_number}. Your renewal amount is Rs "
+                f"{quotes.format_inr(breakdown.final_amount)}. - Gravity Insurance"
+        )
+
+
+def build_quote_image_parameters(name, breakdown):
+        """Ordered {{1}}..{{3}} values for the quote image template."""
+        return [
+                name,
+                breakdown.inputs.vehicle_number,
+                quotes.format_inr(breakdown.final_amount),
+        ]
+
+
+def send_quote_image(number, name, breakdown, contact=None):
+        """Render a calculated quote and send it as a WhatsApp image template.
+
+        Two round trips to Meta: the PNG is uploaded to the media endpoint, then
+        its id goes in the template's header. Returns (ok, error, wamid).
+
+        Callers that must get *something* through should fall back to the text
+        quote_share template on failure - a missing font or an unapproved image
+        template both land here, and neither is worth dropping the quote over."""
+        if not cloud_api_configured():
+                return False, "WhatsApp Cloud API is not configured on this server.", ""
+
+        number = chat.normalize_number(number)
+        if not number:
+                return False, "No mobile number.", ""
+
+        if not quote_image.fonts_available():
+                return False, (
+                        "No TrueType font on this server, so the quote image cannot be "
+                        "drawn. Install the DejaVu fonts or add them under fonts/."
+                ), ""
+
+        try:
+                png = quote_image.render_png_bytes(
+                        breakdown,
+                        contact=QUOTE_CONTACT_LINE if contact is None else contact,
+                )
+        except (quote_image.FontsUnavailable, OSError, ValueError) as exc:
+                return False, f"Could not draw the quote image: {exc}", ""
+
+        vehicle = re.sub(r"[^A-Za-z0-9]", "", breakdown.inputs.vehicle_number) or "quote"
+        ok, media_id, error = whatsapp_media.upload_media(
+                png, f"quote-{vehicle}.png", WA_TOKEN, WA_PHONE_NUMBER_ID,
+                graph_version=WA_GRAPH_VERSION,
+        )
+        if not ok:
+                return False, error, ""
+
+        ok, wamid, error = whatsapp_media.send_image_template(
+                number, WA_TEMPLATE_QUOTE_IMAGE, media_id,
+                build_quote_image_parameters(name, breakdown),
+                WA_TOKEN, WA_PHONE_NUMBER_ID,
+                language=WA_TEMPLATE_LANGUAGE, graph_version=WA_GRAPH_VERSION,
+        )
+        if not ok:
+                return False, error, ""
+
+        chat.save_message(
+                wamid, number, "out", build_quote_image_caption(name, breakdown),
+                msg_type="image", media_id=media_id, status="sent",
+        )
+        return True, "", wamid
 
 
 def build_reminder_text(name, policy_number, expiry_text):

@@ -57,10 +57,17 @@ IST = ZoneInfo("Asia/Kolkata")
 import auth
 import chat
 import legal
-import quote_image
 import quotes
 import reminders
 import whatsapp_media
+
+# Pillow may not be installed in the host's virtualenv. Only the quote image
+# needs it, so an unguarded import here would take the whole site down over one
+# feature - the same reason openpyxl is imported the way it is above.
+try:
+        import quote_image
+except ImportError:
+        quote_image = None
 
 SEND_QUOTE_BASE_COLUMNS = [
         ("name", "Name", ("name", "customer name")),
@@ -1808,6 +1815,12 @@ def send_quote_image(number, name, breakdown, contact=None):
         number = chat.normalize_number(number)
         if not number:
                 return False, "No mobile number.", ""
+
+        if quote_image is None:
+                return False, (
+                        "Pillow is not installed on this server, so the quote image "
+                        "cannot be drawn. Install it into the app's virtualenv."
+                ), ""
 
         if not quote_image.fonts_available():
                 return False, (

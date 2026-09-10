@@ -14,8 +14,10 @@ import sqlite3
 import time
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "reminders.db"
+import paths
+
+BASE_DIR = paths.BASE_DIR
+DB_PATH = paths.data_path("reminders.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sent_reminders (
@@ -36,6 +38,7 @@ LATER_COLUMNS = ("name", "policy_number", "number", "expiry_text")
 
 
 def connect():
+        paths.ensure_data_dir()
         connection = sqlite3.connect(DB_PATH, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.executescript(SCHEMA)

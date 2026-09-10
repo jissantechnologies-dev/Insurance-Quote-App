@@ -16,8 +16,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "messages.db"
+import paths
+
+BASE_DIR = paths.BASE_DIR
+DB_PATH = paths.data_path("messages.db")
 
 # WhatsApp only allows free-form replies within 24 hours of the customer's
 # last message. Outside it, only an approved template may be sent.
@@ -49,6 +51,7 @@ def normalize_number(text):
 
 
 def connect():
+        paths.ensure_data_dir()
         connection = sqlite3.connect(DB_PATH, timeout=10)
         connection.row_factory = sqlite3.Row
         # The webhook and the browser can write at the same time; WAL keeps

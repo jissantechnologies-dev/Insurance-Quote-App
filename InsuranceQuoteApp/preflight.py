@@ -20,7 +20,10 @@ import os
 import sys
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
+import paths
+
+BASE_DIR = paths.BASE_DIR
+DATA_DIR = paths.DATA_DIR
 
 OK, WARN, FAIL = "OK", "WARN", "FAIL"
 
@@ -38,6 +41,7 @@ OPTIONAL_MODULES = {
 LIVE_DATA = (
         "users.json", "auth_secret.key", "messages.db", "reminders.db",
         "sent_quote.json", "sent_payment.json",
+        "customers.json", "newcustomer.txt",
 )
 LIVE_DIRS = ("documents", "chat_media")
 
@@ -159,23 +163,44 @@ def check_whatsapp(report):
                 report.add(OK, "quote contact line")
 
 
-def check_writable(report):
-        """The app writes its live data next to the code, so the app directory
-        and the data inside it must be writable by the Passenger user."""
-        if os.access(BASE_DIR, os.W_OK):
-                report.add(OK, "app dir writable", str(BASE_DIR))
+def check_environment(report):
+        """Which environment this checkout is serving, and from what data.
+
+        A dev instance pointed at the production data directory is the
+        mistake worth catching here - it looks completely normal until a
+        test run edits real customers.
+        """
+        report.add(OK, "environment", paths.ENV_NAME)
+        if DATA_DIR == BASE_DIR:
+                report.add(
+                        WARN if paths.IS_PRODUCTION else OK,
+                        "data directory",
+                        f"{DATA_DIR} (GI_DATA_DIR unset - data sits in the app dir)",
+                )
         else:
-                report.add(FAIL, "app dir writable", f"{BASE_DIR} is read-only")
+                report.add(OK, "data directory", str(DATA_DIR))
+
+
+def check_writable(report):
+        """Live data is written to the data directory, so that directory and
+        the files in it must be writable by the Passenger user."""
+        if os.access(DATA_DIR, os.W_OK):
+                report.add(OK, "data dir writable", str(DATA_DIR))
+        elif not DATA_DIR.exists():
+                report.add(FAIL, "data dir writable",
+                           f"{DATA_DIR} does not exist - create it and chown it")
+        else:
+                report.add(FAIL, "data dir writable", f"{DATA_DIR} is read-only")
 
         for name in LIVE_DATA:
-                path = BASE_DIR / name
+                path = DATA_DIR / name
                 if not path.exists():
                         continue
                 status = OK if os.access(path, os.W_OK) else FAIL
                 report.add(status, f"writable {name}")
 
         for name in LIVE_DIRS:
-                path = BASE_DIR / name
+                path = DATA_DIR / name
                 if not path.exists():
                         continue
                 status = OK if os.access(path, os.W_OK) else FAIL
@@ -214,6 +239,7 @@ def run():
         check_app_modules(report)
         check_fonts(report)
         check_whatsapp(report)
+        check_environment(report)
         check_writable(report)
         check_htaccess(report)
         return report

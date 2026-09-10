@@ -23,16 +23,21 @@ except ImportError:
         load_workbook = None
 
 
-BASE_DIR = Path(__file__).resolve().parent
+import paths
+
+# Code assets ship with the checkout; live data lives in the data directory,
+# which is a separate place per environment (see paths.py).
+BASE_DIR = paths.BASE_DIR
+DATA_DIR = paths.DATA_DIR
 TEMPLATE_PATH = BASE_DIR / "template.html"
 STYLE_PATH = BASE_DIR / "style.css"
-CUSTOMERS_JSON_PATH = BASE_DIR / "customers.json"
-NEW_CUSTOMERS_TEXT_PATH = BASE_DIR / "newcustomer.txt"
-NEW_CUSTOMERS_EXCEL_PATH = BASE_DIR / "newcustomer.xlsx"
+CUSTOMERS_JSON_PATH = paths.data_path("customers.json")
+NEW_CUSTOMERS_TEXT_PATH = paths.data_path("newcustomer.txt")
+NEW_CUSTOMERS_EXCEL_PATH = paths.data_path("newcustomer.xlsx")
 ALLOWED_PAGE_PATHS = {"/", "/leads", "/active-clients", "/expiry-alerts", "/send-quote", "/send-payment-link"}
 
-DOCUMENTS_DIR = BASE_DIR / "documents"
-CHAT_MEDIA_DIR = BASE_DIR / "chat_media"
+DOCUMENTS_DIR = paths.data_path("documents")
+CHAT_MEDIA_DIR = paths.data_path("chat_media")
 DOCUMENT_TYPES = [
         ("rc_book", "RC Book"),
         ("previous_policy", "Previous Policy Copy"),
@@ -104,8 +109,8 @@ SEND_LINK_KINDS = {
                 "message_intro": "Please use the link below to complete your payment.",
         },
 }
-SEND_LINK_SENT_PATHS = {kind: BASE_DIR / f"sent_{kind}.json" for kind in SEND_LINK_KINDS}
-SEND_LINK_BATCH_PATHS = {kind: BASE_DIR / f"batch_{kind}.json" for kind in SEND_LINK_KINDS}
+SEND_LINK_SENT_PATHS = {kind: paths.data_path(f"sent_{kind}.json") for kind in SEND_LINK_KINDS}
+SEND_LINK_BATCH_PATHS = {kind: paths.data_path(f"batch_{kind}.json") for kind in SEND_LINK_KINDS}
 
 # --- WhatsApp Cloud API ----------------------------------------------------
 # Set these in cPanel -> Setup Python App -> Environment variables. When
@@ -153,11 +158,13 @@ def load_json_list(path):
 
 
 def save_sent_history(kind):
+        paths.ensure_data_dir()
         with SEND_LINK_SENT_PATHS[kind].open("w", encoding="utf-8") as file:
                 json.dump(SEND_LINK_SENT[kind], file, indent=4)
 
 
 def save_pending_batch(kind):
+        paths.ensure_data_dir()
         with SEND_LINK_BATCH_PATHS[kind].open("w", encoding="utf-8") as file:
                 json.dump(SEND_LINK_BATCHES[kind], file, indent=4)
 
@@ -207,23 +214,33 @@ def get_new_customers_excel_path():
         if NEW_CUSTOMERS_EXCEL_PATH.exists():
                 return NEW_CUSTOMERS_EXCEL_PATH
 
-        for candidate in sorted(BASE_DIR.glob("*.xlsx")):
+        for candidate in sorted(DATA_DIR.glob("*.xlsx")):
                 if not candidate.name.startswith("~$"):
                         return candidate
         return None
 
 
 def load_customers():
+        """The active client list, or an empty one on a fresh environment.
+
+        A brand-new environment starts with no customers.json at all, so a
+        missing file is normal rather than an error - it means "no clients
+        yet", and the first save writes it.
+        """
+        if not CUSTOMERS_JSON_PATH.exists():
+                return []
         with CUSTOMERS_JSON_PATH.open("r", encoding="utf-8") as file:
                 return json.load(file)
 
 
 def save_customers(customers):
+        paths.ensure_data_dir()
         with CUSTOMERS_JSON_PATH.open("w", encoding="utf-8") as file:
                 json.dump(customers, file, indent=4)
 
 
 def load_new_customers_text():
+        paths.ensure_data_dir()
         with NEW_CUSTOMERS_TEXT_PATH.open("a+", encoding="utf-8") as file:
                 file.seek(0)
                 text = file.read().strip()
@@ -241,6 +258,7 @@ def save_new_customer_lines(lines):
         content = "\n".join(lines)
         if content:
                 content += "\n"
+        paths.ensure_data_dir()
         NEW_CUSTOMERS_TEXT_PATH.write_text(content, encoding="utf-8")
 
 
@@ -3202,6 +3220,22 @@ def build_auth_nav_links(user):
         return users_link, auth_link
 
 
+def build_env_banner():
+        """A standing marker on every non-production page.
+
+        Dev and production are the same app on near-identical URLs, so the
+        only reliable way to know which tab is which is for dev to say so.
+        Production shows nothing, keeping the live site unchanged.
+        """
+        if paths.IS_PRODUCTION:
+                return ""
+        return (
+                '<p class="env-banner">'
+                f'{escape(paths.ENV_NAME.upper())} ENVIRONMENT - test data, not the live site'
+                '</p>'
+        )
+
+
 def render_with_template(page_content, user=None, active_path=""):
         users_link, auth_link = build_auth_nav_links(user)
         template = TEMPLATE_PATH.read_text(encoding="utf-8")
@@ -3214,6 +3248,7 @@ def render_with_template(page_content, user=None, active_path=""):
                 .replace("{{NAV_SENDPAYMENT_CLASS}}", build_nav_class(active_path, "/send-payment-link"))
                 .replace("{{NAV_USERS_LINK}}", users_link)
                 .replace("{{NAV_AUTH_LINK}}", auth_link)
+                .replace("{{ENV_BANNER}}", build_env_banner())
                 .replace("{{PAGE_CONTENT}}", page_content)
         )
 

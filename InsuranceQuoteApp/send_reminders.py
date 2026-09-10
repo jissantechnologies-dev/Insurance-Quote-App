@@ -8,8 +8,15 @@ on another timezone, so check what 09:00 IST is locally before setting it):
         /home/USER/APP_PATH/send_reminders.py >> /home/USER/APP_PATH/reminders.log 2>&1
 
 Cron does not load the cPanel "Setup Python App" environment variables, so the
-WhatsApp credentials have to be provided here. Point GI_ENV_FILE at a file of
-KEY=value lines, or export them in the crontab itself.
+WhatsApp credentials and GI_DATA_DIR have to be provided here. Point
+GI_ENV_FILE at a file of KEY=value lines, or export them in the crontab
+itself. Without GI_DATA_DIR the run reads the app directory rather than the
+environment's data, and finds no customers.
+
+Only production sends. Dev and production share one WhatsApp number, so a
+second cron would message every customer twice; on a non-production
+environment this refuses to send unless --force is passed, and --dry-run
+always works. Do not install the cron on dev.
 
 Run with --dry-run to see who would be messaged without sending anything.
 """
@@ -47,6 +54,16 @@ def main():
         import main as core
 
         dry_run = "--dry-run" in sys.argv
+        force = "--force" in sys.argv
+
+        import paths
+        if not paths.IS_PRODUCTION and not dry_run and not force:
+                print(f"Refusing to send from the '{paths.ENV_NAME}' environment -"
+                      " it shares the production WhatsApp number, so this would"
+                      " message real customers a second time. Use --dry-run to"
+                      " test, or --force if you really mean it.", file=sys.stderr)
+                return 1
+
         if not core.cloud_api_configured():
                 print("WhatsApp Cloud API is not configured - set GI_WA_TOKEN and "
                       "GI_WA_PHONE_NUMBER_ID.", file=sys.stderr)

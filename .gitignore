@@ -44,3 +44,13 @@ InsuranceQuoteApp/chat_media/
 # Reminder send log - which policies have already been messaged.
 InsuranceQuoteApp/reminders.db
 InsuranceQuoteApp/reminders.log
+
+# The active client list, the imported-leads scratch file and any customer
+# workbook - live data written by the running server, and the reason
+# production can start empty while dev keeps a full data set. The repo's
+# starting copies live in InsuranceQuoteApp/seed/ and are only ever copied
+# into a data directory on purpose (bootstrap_data.py --seed).
+InsuranceQuoteApp/customers.json
+InsuranceQuoteApp/newcustomer.txt
+InsuranceQuoteApp/newcustomer.xlsx
+InsuranceQuoteApp/customerxlfile.xlsx

@@ -1293,3 +1293,17 @@ pre {
     padding: 4px 10px;
     cursor: pointer;
 }
+
+/* Non-production marker. Deliberately loud: the whole point is that a dev
+   tab cannot be mistaken for the live site at a glance. */
+.env-banner {
+    margin: 0 0 12px;
+    padding: 8px 14px;
+    border-radius: 8px;
+    background: #b45309;
+    color: #fff;
+    font-size: 0.85rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-align: center;
+}

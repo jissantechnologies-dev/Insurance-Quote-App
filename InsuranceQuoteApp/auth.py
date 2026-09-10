@@ -1,6 +1,7 @@
 """Authentication and user management for the Gravity Insurance app.
 
-Users are stored in users.json next to this file. New registrations start
+Users are stored in users.json in the environment's data directory
+(see paths.py; the app directory itself when GI_DATA_DIR is unset). New registrations start
 with status "pending" and must be approved by an admin before they can
 log in. Sessions are HMAC-signed cookie tokens; the signing secret is
 persisted in auth_secret.key so sessions survive restarts.
@@ -20,9 +21,11 @@ import time
 from html import escape
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
-USERS_JSON_PATH = BASE_DIR / "users.json"
-SECRET_KEY_PATH = BASE_DIR / "auth_secret.key"
+import paths
+
+BASE_DIR = paths.BASE_DIR
+USERS_JSON_PATH = paths.data_path("users.json")
+SECRET_KEY_PATH = paths.data_path("auth_secret.key")
 
 SESSION_COOKIE_NAME = "gi_session"
 SESSION_DURATION_SECONDS = 60 * 60 * 24 * 7  # 7 days
@@ -67,6 +70,7 @@ def load_users():
 
 
 def save_users(users):
+        paths.ensure_data_dir()
         with USERS_JSON_PATH.open("w", encoding="utf-8") as file:
                 json.dump(users, file, indent=4)
 
@@ -168,6 +172,7 @@ def _get_secret():
         if SECRET_KEY_PATH.exists():
                 return SECRET_KEY_PATH.read_bytes()
         secret = secrets.token_bytes(32)
+        paths.ensure_data_dir()
         SECRET_KEY_PATH.write_bytes(secret)
         return secret
 

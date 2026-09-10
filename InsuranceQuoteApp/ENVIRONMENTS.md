@@ -10,7 +10,7 @@ Two independent instances of the same app on one cPanel account:
 | data dir | `~/gi-data/production` | `~/gi-data/dev` |
 | default branch | `main` | `quote-automation` |
 | data | starts empty | seeded with the customer list |
-| reminder cron | yes | **no** |
+| reminder cron | yes | only with a non-overlapping list |
 | page banner | none | orange "DEV ENVIRONMENT" bar |
 
 They share the code and the WhatsApp credentials. They share nothing else.
@@ -116,17 +116,39 @@ Both environments send from the **same** WhatsApp number. A dev test message
 is indistinguishable from a production one at the customer's end, and it
 counts against the same template limits and quality rating.
 
-Two consequences:
+The risk that matters is **overlapping customer lists**, not the shared number
+itself. Each environment keeps its own `reminders.db`, so neither can see that
+the other has already messaged someone; a customer listed in both gets
+reminded twice, once by each cron. Lists that share no number are safe, and
+dev can then run its own cron.
 
-- **Never install the reminder cron on dev.** Two crons over overlapping
-  customer lists means every customer gets messaged twice.
-  `send_reminders.py` refuses to send from a non-production environment
-  unless `--force` is passed; `--dry-run` always works.
-- **Test with your own number.** Dev's seeded customer list contains real
-  mobile numbers. Edit a row to your own number before sending anything.
+`send_reminders.py` enforces exactly that. On a non-production environment it
+compares today's recipients against the customer list at `GI_PEER_DATA_DIR`
+and refuses to send if any number appears in both:
 
-If this becomes a problem, the fix is a Meta test number and a separate
-`GI_ENV_FILE` for dev — no code change needed, just different `GI_WA_*`
+```bash
+GI_DATA_DIR=~/gi-data/dev GI_ENV_NAME=dev \
+GI_PEER_DATA_DIR=~/gi-data/production \
+    $PY send_reminders.py --dry-run
+```
+
+Numbers are normalized first, so `9941456453` in one list and
+`919941456453` in the other still count as the same person. `--dry-run`
+reports what it finds and carries on; `--force` skips the check. If
+`GI_PEER_DATA_DIR` is unset or unreadable the send is refused — unverifiable
+is not the same as safe.
+
+Two practical points:
+
+- **Keep dev's list to test numbers.** Dev seeded from production, so its
+  starting list is entirely overlapping — every number in it is a real
+  customer. Cut it down to your own numbers before running a dev send, or the
+  guard will (correctly) block you.
+- **A dev cron needs `GI_PEER_DATA_DIR` in the crontab**, the same way it
+  needs `GI_DATA_DIR` — cron loads none of the cPanel app's variables.
+
+If sharing the number becomes awkward, the fix is a Meta test number and a
+separate `GI_ENV_FILE` for dev — no code change, just different `GI_WA_*`
 values on the dev app.
 
 ## The reminder cron

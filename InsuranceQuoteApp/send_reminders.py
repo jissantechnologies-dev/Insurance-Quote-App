@@ -13,10 +13,13 @@ GI_ENV_FILE at a file of KEY=value lines, or export them in the crontab
 itself. Without GI_DATA_DIR the run reads the app directory rather than the
 environment's data, and finds no customers.
 
-Only production sends. Dev and production share one WhatsApp number, so a
-second cron would message every customer twice; on a non-production
-environment this refuses to send unless --force is passed, and --dry-run
-always works. Do not install the cron on dev.
+Dev and production send from one WhatsApp number and keep separate dedup
+logs, so a customer listed in both environments would be reminded twice, once
+by each cron. A non-production run therefore compares today's recipients
+against the customer list at GI_PEER_DATA_DIR (production's data directory)
+and refuses to send if any number appears in both. Lists that do not overlap
+send normally, so dev can have its own cron. --force skips the check;
+--dry-run reports what it finds and carries on.
 
 Run with --dry-run to see who would be messaged without sending anything.
 """
@@ -48,6 +51,68 @@ def load_env_file():
                 os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
+def check_peer_overlap(core, dry_run):
+        """Stop a send that would remind someone the other environment also
+        reminds. Returns 0 to carry on, 1 to stop.
+
+        Dev and production send from one WhatsApp number and keep separate
+        dedup logs, so neither can see that the other has already messaged a
+        customer. Two crons over lists that share a number means that customer
+        hears from us twice. Distinct lists are safe, and that is what this
+        checks - the environment's name proves nothing either way.
+
+        Production is the authority on who its customers are and is not
+        checked. Dev must be told where production's data lives, via
+        GI_PEER_DATA_DIR; without it there is nothing to compare against and
+        the answer is unknowable rather than "fine".
+        """
+        import paths
+
+        if paths.IS_PRODUCTION:
+                return 0
+
+        # A dry run sends nothing, so it reports what it finds and carries on -
+        # it is how you check for an overlap in the first place. The wording
+        # follows suit: a dry run is warning, not refusing.
+        def stop(problem, remedy):
+                lead = "Overlap check (dry run)" if dry_run else "Refusing to send"
+                print(f"{lead}: {problem}\n{remedy}", file=sys.stderr)
+                return 0 if dry_run else 1
+
+        peer_dir = os.environ.get("GI_PEER_DATA_DIR", "").strip()
+        if not peer_dir:
+                return stop(
+                        f"GI_PEER_DATA_DIR is unset, so there is no way to check\n"
+                        "whether this environment's reminders also go out from "
+                        "production.",
+                        "Point it at production's data directory.",
+                )
+
+        try:
+                due = core.collect_expiring_customers(core.get_today())
+                shared = core.find_shared_recipients(due, peer_dir)
+        except core.PeerDataError as exc:
+                return stop(
+                        f"production's customer list could not be read\n({exc}).",
+                        "Fix GI_PEER_DATA_DIR.",
+                )
+
+        if not shared:
+                return 0
+
+        listed = "\n".join(
+                f"  {item['name']} ({item['mobileNumber']}), {item['daysLeft']}d"
+                for item in shared
+        )
+        return stop(
+                f"{len(shared)} of today's reminders would go to numbers that\n"
+                "production also holds, and both environments send from the same "
+                "WhatsApp\nnumber - these customers would be messaged twice:\n"
+                f"{listed}",
+                "Remove them from this environment's customer list, or use --force.",
+        )
+
+
 def main():
         load_env_file()
         sys.path.insert(0, str(BASE_DIR))
@@ -56,12 +121,7 @@ def main():
         dry_run = "--dry-run" in sys.argv
         force = "--force" in sys.argv
 
-        import paths
-        if not paths.IS_PRODUCTION and not dry_run and not force:
-                print(f"Refusing to send from the '{paths.ENV_NAME}' environment -"
-                      " it shares the production WhatsApp number, so this would"
-                      " message real customers a second time. Use --dry-run to"
-                      " test, or --force if you really mean it.", file=sys.stderr)
+        if not force and check_peer_overlap(core, dry_run) != 0:
                 return 1
 
         if not core.cloud_api_configured():

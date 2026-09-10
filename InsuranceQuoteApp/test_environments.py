@@ -174,6 +174,128 @@ class CustomerDataIsLiveData(unittest.TestCase):
                         )
 
 
+class OverlapGuard(unittest.TestCase):
+        """Two environments on one WhatsApp number are safe exactly when their
+        customer lists do not share a number. The guard checks that, rather
+        than the environment's name."""
+
+        def build_dirs(self, root, dev_numbers, prod_numbers):
+                import json
+                from datetime import date, timedelta
+
+                tomorrow = (date.today() + timedelta(days=1)).isoformat()
+                dev, prod = root / "dev", root / "prod"
+                for directory, numbers in ((dev, dev_numbers), (prod, prod_numbers)):
+                        directory.mkdir()
+                        (directory / "customers.json").write_text(
+                                json.dumps([
+                                        {"name": f"C{number}", "mobileNumber": number,
+                                         "PolicyNumber": "P1",
+                                         "policyExpiryDate": tomorrow}
+                                        for number in numbers
+                                ]),
+                                encoding="utf-8",
+                        )
+                return dev, prod
+
+        def run_reminders(self, dev, prod, args=(), peer=True):
+                env = dict(os.environ)
+                env["GI_DATA_DIR"] = str(dev)
+                env["GI_ENV_NAME"] = "dev"
+                # Present but invalid: the guard, not the config check, must be
+                # what decides. A bad token cannot deliver a message.
+                env["GI_WA_TOKEN"] = "invalid-for-tests"
+                env["GI_WA_PHONE_NUMBER_ID"] = "0"
+                if peer:
+                        env["GI_PEER_DATA_DIR"] = str(prod)
+                else:
+                        env.pop("GI_PEER_DATA_DIR", None)
+                return subprocess.run(
+                        [sys.executable, str(BASE_DIR / "send_reminders.py"), *args],
+                        cwd=BASE_DIR, capture_output=True, text=True, env=env,
+                )
+
+        def test_a_shared_number_stops_the_send(self):
+                with tempfile.TemporaryDirectory() as tmp:
+                        dev, prod = self.build_dirs(
+                                Path(tmp), ["9941456453"], ["9941456453"])
+                        result = self.run_reminders(dev, prod)
+                        self.assertEqual(result.returncode, 1)
+                        self.assertIn("messaged twice", result.stderr)
+
+        def test_the_same_number_written_differently_still_stops_it(self):
+                """One list with the country code and one without is the same
+                person; normalizing both is the whole point."""
+                with tempfile.TemporaryDirectory() as tmp:
+                        dev, prod = self.build_dirs(
+                                Path(tmp), ["9941456453"], ["919941456453"])
+                        result = self.run_reminders(dev, prod)
+                        self.assertEqual(result.returncode, 1)
+                        self.assertIn("messaged twice", result.stderr)
+
+        def test_distinct_lists_are_allowed_to_send(self):
+                """Dev test numbers production has never heard of: no overlap,
+                so dev may run its own cron."""
+                with tempfile.TemporaryDirectory() as tmp:
+                        dev, prod = self.build_dirs(
+                                Path(tmp), ["9000000001"], ["9941456453"])
+                        result = self.run_reminders(dev, prod)
+                        self.assertNotIn("messaged twice", result.stderr)
+                        # It got past the guard and tried to send; the invalid
+                        # token is what stopped it.
+                        self.assertIn("sent=0", result.stdout)
+
+        def test_a_dry_run_reports_the_overlap_and_carries_on(self):
+                with tempfile.TemporaryDirectory() as tmp:
+                        dev, prod = self.build_dirs(
+                                Path(tmp), ["9941456453"], ["9941456453"])
+                        result = self.run_reminders(dev, prod, args=("--dry-run",))
+                        self.assertEqual(result.returncode, 0)
+                        self.assertIn("Overlap check (dry run)", result.stderr)
+                        self.assertNotIn("Refusing", result.stderr)
+
+        def test_force_skips_the_check(self):
+                with tempfile.TemporaryDirectory() as tmp:
+                        dev, prod = self.build_dirs(
+                                Path(tmp), ["9941456453"], ["9941456453"])
+                        result = self.run_reminders(
+                                dev, prod, args=("--force", "--dry-run"))
+                        self.assertEqual(result.returncode, 0)
+                        self.assertNotIn("messaged twice", result.stderr)
+
+        def test_an_unknown_peer_stops_the_send(self):
+                """Unverifiable is not the same as safe."""
+                with tempfile.TemporaryDirectory() as tmp:
+                        dev, prod = self.build_dirs(
+                                Path(tmp), ["9000000001"], ["9941456453"])
+                        result = self.run_reminders(dev, prod, peer=False)
+                        self.assertEqual(result.returncode, 1)
+                        self.assertIn("GI_PEER_DATA_DIR is unset", result.stderr)
+
+        def test_an_unreadable_peer_stops_the_send(self):
+                with tempfile.TemporaryDirectory() as tmp:
+                        dev, prod = self.build_dirs(
+                                Path(tmp), ["9000000001"], ["9941456453"])
+                        (prod / "customers.json").write_text("{not json",
+                                                             encoding="utf-8")
+                        result = self.run_reminders(dev, prod)
+                        self.assertEqual(result.returncode, 1)
+                        self.assertIn("could not be read", result.stderr)
+
+        def test_a_blank_peer_is_a_real_answer(self):
+                """Production starting empty means no overlap, not an error."""
+                import main as core
+
+                with tempfile.TemporaryDirectory() as tmp:
+                        self.assertEqual(core.load_customer_numbers(tmp), set())
+
+        def test_a_missing_peer_directory_raises(self):
+                import main as core
+
+                with self.assertRaises(core.PeerDataError):
+                        core.load_customer_numbers(BASE_DIR / "no-such-dir")
+
+
 def working_bash():
         for candidate in ("bash", r"C:\Program Files\Git\bin\bash.exe"):
                 try:

@@ -1924,6 +1924,58 @@ def collect_expiring_customers(today):
         return due
 
 
+class PeerDataError(Exception):
+        """The other environment's data could not be read, so an overlap check
+        cannot be trusted. Raised rather than returning "no overlap", which
+        would read as a clean bill of health."""
+
+
+def load_customer_numbers(data_dir):
+        """Every mobile number in another environment's customer list.
+
+        Numbers are normalized the way sends are, so 9941456453 and
+        919941456453 in the two environments still count as the same person.
+        """
+        directory = Path(data_dir).expanduser()
+        if not directory.is_dir():
+                raise PeerDataError(f"{directory} is not a directory")
+
+        path = directory / "customers.json"
+        if not path.exists():
+                # A blank environment genuinely has no customers; that is a
+                # real answer, not a missing file.
+                return set()
+
+        try:
+                with path.open("r", encoding="utf-8") as file:
+                        customers = json.load(file)
+        except (ValueError, OSError) as exc:
+                raise PeerDataError(f"{path} could not be read: {exc}") from exc
+
+        numbers = set()
+        for customer in customers or []:
+                number = chat.normalize_number(get_customer_value(
+                        customer, "mobileNumber", "phoneNumber", "phone"
+                ))
+                if number:
+                        numbers.add(number)
+        return numbers
+
+
+def find_shared_recipients(items, peer_data_dir):
+        """Which of these reminders would go to a number the other
+        environment also holds.
+
+        This is the check that matters when two environments send from one
+        WhatsApp number: a customer listed in both would be reminded twice,
+        once by each cron, and the per-environment dedup logs cannot see each
+        other to prevent it.
+        """
+        peer_numbers = load_customer_numbers(peer_data_dir)
+        return [item for item in items
+                if item.get("mobileNumber") in peer_numbers]
+
+
 def send_expiry_reminders(today=None, dry_run=False):
         """Send one renewal reminder per policy per milestone.
 

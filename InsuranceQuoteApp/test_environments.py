@@ -22,6 +22,7 @@ BASE_DIR = Path(__file__).resolve().parent
 GITIGNORE = BASE_DIR.parent / ".gitignore"
 DEPLOY_SH = BASE_DIR / "deploy.sh"
 ARCHIVE_SH = BASE_DIR / "archive_data.sh"
+SETUP_SH = BASE_DIR / "setup_environments.sh"
 
 # Modules that resolve a live-data path at import time. Each is re-imported
 # under the temporary settings to prove it follows them.
@@ -316,7 +317,7 @@ BASH = working_bash()
 class Scripts(unittest.TestCase):
         @unittest.skipUnless(BASH, "no working bash on this machine")
         def test_scripts_are_valid_bash(self):
-                for script in (DEPLOY_SH, ARCHIVE_SH):
+                for script in (DEPLOY_SH, ARCHIVE_SH, SETUP_SH):
                         result = subprocess.run(
                                 [BASH, "-n", str(script)],
                                 capture_output=True, text=True,
@@ -340,6 +341,21 @@ class Scripts(unittest.TestCase):
                 self.assertIn('if [ "$BLANK" = 0 ]', code)
                 # The removal must sit after the archive has been verified.
                 self.assertLess(code.index("tar -tzf"), code.index("rm -rf"))
+
+        def test_setup_archives_before_it_clears_anything(self):
+                """Production's only copy of the chat history and the uploaded
+                documents is the archive, so it must be written first."""
+                code = "\n".join(
+                        line for line in SETUP_SH.read_text(encoding="utf-8").splitlines()
+                        if not line.lstrip().startswith("#")
+                )
+                self.assertLess(code.index("archive_data.sh"), code.index("rm -rf"))
+
+        def test_setup_leaves_the_htaccess_alone(self):
+                """Clearing .htaccess would reintroduce the July 2026 outage."""
+                text = SETUP_SH.read_text(encoding="utf-8")
+                start = text.index("LIVE_NAMES=(")
+                self.assertNotIn(".htaccess", text[start:text.index(")", start)])
 
         def test_bootstrap_refuses_to_seed_the_app_directory(self):
                 """Seeding with GI_DATA_DIR unset would put dev data in the repo."""

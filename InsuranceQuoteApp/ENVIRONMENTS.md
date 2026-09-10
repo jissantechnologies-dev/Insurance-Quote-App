@@ -39,6 +39,22 @@ starting copies live in `seed/` and only ever reach a data directory when
 
 ## First-time setup
 
+`setup_environments.sh` does steps 1 and 2 in one go — archive production,
+create both data directories, seed dev, and clear the live data out of
+production's app root. It prints the cPanel values for steps 3-5 as it
+finishes:
+
+```bash
+cd ~/repo && git fetch origin && git checkout quote-automation && git pull
+bash ~/repo/InsuranceQuoteApp/setup_environments.sh --dry-run
+bash ~/repo/InsuranceQuoteApp/setup_environments.sh
+```
+
+Pass `--keep-production-data` to move production's current data into its new
+data directory instead of starting blank. The steps below are what that
+script automates, written out in case you would rather run them one at a
+time.
+
 ### 1. Archive production, then blank it
 
 ```bash

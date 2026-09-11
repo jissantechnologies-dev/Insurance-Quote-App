@@ -34,7 +34,10 @@ STYLE_PATH = BASE_DIR / "style.css"
 CUSTOMERS_JSON_PATH = paths.data_path("customers.json")
 NEW_CUSTOMERS_TEXT_PATH = paths.data_path("newcustomer.txt")
 NEW_CUSTOMERS_EXCEL_PATH = paths.data_path("newcustomer.xlsx")
-ALLOWED_PAGE_PATHS = {"/", "/leads", "/active-clients", "/expiry-alerts", "/send-quote", "/send-payment-link"}
+ALLOWED_PAGE_PATHS = {
+        "/", "/leads", "/active-clients", "/expiry-alerts",
+        "/send-quote", "/send-payment-link", "/bulk-quote",
+}
 
 DOCUMENTS_DIR = paths.data_path("documents")
 CHAT_MEDIA_DIR = paths.data_path("chat_media")
@@ -60,6 +63,7 @@ CHART_LEGEND_HTML = (
 IST = ZoneInfo("Asia/Kolkata")
 
 import auth
+import campaigns
 import chat
 import legal
 import quotes
@@ -2917,6 +2921,752 @@ def send_quote_for_row(row_id, kind="quote"):
         return payload, 200
 
 
+# --- Bulk quote -------------------------------------------------------------
+# One offer image (or one text template) going out to a filtered slice of the
+# leads list. Unlike Send Quote, nothing is imported: the recipients are the
+# leads already in the app, narrowed by vehicle type, brand and model.
+#
+# Both templates below must be approved in the WhatsApp Manager before a bulk
+# run will work, and both take a single body parameter, the customer's name:
+#   bulk_offer_image  - IMAGE header, body "Hello {{1}}, ..."
+#   bulk_offer_text   - text only,   body "Hello {{1}}, ..."
+WA_TEMPLATE_BULK_IMAGE = os.environ.get("GI_WA_TEMPLATE_BULK_IMAGE", "bulk_offer_image")
+WA_TEMPLATE_BULK_TEXT = os.environ.get("GI_WA_TEMPLATE_BULK_TEXT", "bulk_offer_text")
+
+BULK_SENT_PATH = paths.data_path("sent_bulk_quote.json")
+
+# The wa.me fallback text, used only when the Cloud API is not configured on
+# this server (local development). Templates carry their own wording.
+BULK_FALLBACK_MESSAGE = (
+        "Hello {name},\n\n"
+        "Gravity Insurance has a new offer on your {vehicle}.\n\n"
+        "Reply to this message and we will share your quote.\n\n"
+        "Thank you,\nGravity Insurance"
+)
+
+
+def load_bulk_sent_history():
+        return load_json_list(BULK_SENT_PATH)
+
+
+def record_bulk_send(entry):
+        """Append one attempt to the bulk history, newest first."""
+        paths.ensure_data_dir()
+        history = load_bulk_sent_history()
+        history.insert(0, entry)
+        del history[500:]
+        with BULK_SENT_PATH.open("w", encoding="utf-8") as file:
+                json.dump(history, file, indent=4)
+        return entry
+
+
+def build_bulk_lead(customer):
+        """One lead flattened into what the bulk page needs.
+
+        `id` is the normalised mobile number: the leads file has no stable key
+        of its own, and a row's position shifts as leads are added or
+        converted, so an index would send to the wrong person."""
+        # The leads file was written with a BOM, which would otherwise ride
+        # along into the name parameter of the WhatsApp template.
+        name = str(get_customer_value(customer, "name")).lstrip("﻿").strip()
+        raw_mobile = str(get_customer_value(customer, "mobileNumber", "phoneNumber", "phone")).strip()
+        mobile = normalize_send_quote_mobile(raw_mobile)
+        car_type = str(get_customer_value(customer, "carType", "car")).strip()
+        return {
+                "id": mobile or raw_mobile,
+                "name": name,
+                "mobileNumber": mobile,
+                "rawMobile": raw_mobile,
+                "carType": car_type,
+                "segment": classify_vehicle_segment(car_type),
+                "carBrand": str(get_customer_value(customer, "carBrand")).strip(),
+                "carModel": str(get_customer_value(customer, "carModel")).strip(),
+                "valid": bool(name and mobile),
+        }
+
+
+def load_bulk_leads():
+        """Every lead, de-duplicated by mobile number.
+
+        The same person can sit in the leads file twice (re-enquired months
+        apart, say); sending one offer to them twice in a single run is a
+        visible mistake, so only the first row of each number survives."""
+        leads = []
+        seen = set()
+        for customer in load_new_customers():
+                lead = build_bulk_lead(customer)
+                if lead["id"]:
+                        if lead["id"] in seen:
+                                continue
+                        seen.add(lead["id"])
+                leads.append(lead)
+        return leads
+
+
+def find_bulk_lead(lead_id):
+        return next((lead for lead in load_bulk_leads() if lead["id"] == lead_id), None)
+
+
+def filter_bulk_leads(leads, segment="", brand="", model="", search=""):
+        """Narrow the leads list the way the page's controls do.
+
+        Filtering lives here as well as in the browser so the same rule can be
+        checked without a page."""
+        segment_value = str(segment or "").strip().lower()
+        brand_value = str(brand or "").strip().lower()
+        model_value = str(model or "").strip().lower()
+        search_value = str(search or "").strip().lower()
+
+        matched = []
+        for lead in leads:
+                if segment_value and lead["segment"].lower() != segment_value:
+                        continue
+                if brand_value and lead["carBrand"].lower() != brand_value:
+                        continue
+                if model_value and lead["carModel"].lower() != model_value:
+                        continue
+                haystack = f"{lead['name']} {lead['rawMobile']} {lead['carModel']}".lower()
+                if search_value and search_value not in haystack:
+                        continue
+                matched.append(lead)
+        return matched
+
+
+def get_campaign_media_id(campaign):
+        """The WhatsApp media id for a campaign image, uploading it if needed.
+
+        Returns (media_id, error). The id is cached on the campaign record so a
+        run of 200 leads uploads the picture once, not 200 times."""
+        cached = str(campaign.get("mediaId") or "").strip()
+        if cached:
+                return cached, ""
+
+        path = campaigns.campaign_file_path(campaign)
+        if path is None:
+                return "", "The campaign image is missing from this server."
+
+        ok, media_id, error = whatsapp_media.upload_media(
+                path.read_bytes(), path.name, WA_TOKEN, WA_PHONE_NUMBER_ID,
+                graph_version=WA_GRAPH_VERSION, mime=campaign.get("mime", "image/png"),
+        )
+        if not ok:
+                return "", error
+        campaigns.set_media_id(campaign["id"], media_id)
+        return media_id, ""
+
+
+def send_bulk_campaign_image(lead, campaign):
+        """Send the campaign image to one lead. Returns (ok, error, wamid).
+
+        A cached media id that Meta has since expired looks like any other send
+        failure, so one retry clears the cache and re-uploads before giving
+        up."""
+        for attempt in (0, 1):
+                media_id, error = get_campaign_media_id(campaign)
+                if not media_id:
+                        return False, error, ""
+
+                ok, wamid, error = whatsapp_media.send_image_template(
+                        lead["mobileNumber"], WA_TEMPLATE_BULK_IMAGE, media_id, [lead["name"]],
+                        WA_TOKEN, WA_PHONE_NUMBER_ID,
+                        language=WA_TEMPLATE_LANGUAGE, graph_version=WA_GRAPH_VERSION,
+                )
+                if ok:
+                        chat.save_message(
+                                wamid, lead["mobileNumber"], "out",
+                                f"[{campaign['title']}] campaign image sent to {lead['name']}",
+                                msg_type="image", media_id=media_id, status="sent",
+                        )
+                        return True, "", wamid
+
+                if attempt == 0 and campaign.get("mediaId"):
+                        campaigns.set_media_id(campaign["id"], "")
+                        campaign["mediaId"] = ""
+                        continue
+                return False, error, ""
+        return False, "The campaign image could not be sent.", ""
+
+
+def send_bulk_quote_to_lead(lead_id, campaign_id=""):
+        """Send one lead their copy of the campaign. Returns (payload, status).
+
+        Every attempt is written to the history file, successes and failures
+        alike - on a bulk run, knowing who was *not* reached matters as much as
+        knowing who was."""
+        lead = find_bulk_lead(lead_id)
+        if lead is None:
+                return {"success": False, "error": "Lead not found."}, 404
+
+        campaign = None
+        if campaign_id:
+                campaign = campaigns.get_campaign(campaign_id)
+                if campaign is None:
+                        return {"success": False, "error": "Campaign image not found."}, 404
+
+        entry = {
+                "name": lead["name"],
+                "mobileNumber": lead["rawMobile"],
+                "vehicle": " ".join(part for part in (lead["carBrand"], lead["carModel"]) if part),
+                "campaign": campaign["title"] if campaign else "Text only",
+                "status": "Failed",
+                "error": "",
+                "sentAt": datetime.now(IST).strftime("%Y-%m-%d %I:%M %p"),
+        }
+
+        if not lead["valid"]:
+                entry["error"] = "Lead has no usable name or mobile number."
+                record_bulk_send(entry)
+                return {"success": False, "status": "Failed", "error": entry["error"]}, 200
+
+        if not cloud_api_configured():
+                # Local development: hand back a wa.me link instead of failing,
+                # the same fallback the Send Quote page offers.
+                entry["error"] = "WhatsApp Cloud API is not configured on this server."
+                record_bulk_send(entry)
+                return {
+                        "success": False,
+                        "status": "Failed",
+                        "error": entry["error"],
+                        "waLink": build_whatsapp_link(
+                                lead["mobileNumber"],
+                                BULK_FALLBACK_MESSAGE.format(
+                                        name=lead["name"],
+                                        vehicle=(lead["carModel"] or lead["carType"] or "vehicle"),
+                                ),
+                        ),
+                }, 200
+
+        if campaign is None:
+                ok, error, _ = send_template_message(
+                        lead["mobileNumber"], WA_TEMPLATE_BULK_TEXT, [lead["name"]]
+                )
+        else:
+                ok, error, _ = send_bulk_campaign_image(lead, campaign)
+
+        if not ok:
+                entry["error"] = error
+                record_bulk_send(entry)
+                return {"success": False, "status": "Failed", "error": error}, 200
+
+        entry["status"] = "Sent"
+        record_bulk_send(entry)
+        return {"success": True, "status": "Sent", "error": "", "sentAt": entry["sentAt"]}, 200
+
+
+def build_campaign_payload(campaign):
+        return {
+                "id": campaign["id"],
+                "title": campaign["title"],
+                "url": f"/campaign-image/{campaign['id']}",
+                "uploadedAt": campaign.get("uploadedAt", ""),
+        }
+
+
+def import_bulk_campaign_image(filename, file_bytes, title=""):
+        """Returns (payload, http_status) for the campaign upload endpoint."""
+        campaign, error = campaigns.save_campaign_image(filename, file_bytes, title)
+        if campaign is None:
+                return {"success": False, "error": error}, 400
+        return {"success": True, "campaign": build_campaign_payload(campaign)}, 200
+
+
+def get_campaign_image_path(campaign_id):
+        """The stored image for a campaign id arriving from a URL, or None."""
+        if not campaigns.is_campaign_id(campaign_id):
+                return None
+        return campaigns.campaign_file_path(campaigns.get_campaign(campaign_id))
+
+
+def build_bulk_quote_content():
+        leads = load_bulk_leads()
+        segment_options = sorted({lead["segment"] for lead in leads if lead["segment"]})
+        brand_options = sorted({lead["carBrand"] for lead in leads if lead["carBrand"]}, key=str.lower)
+        model_options = sorted({lead["carModel"] for lead in leads if lead["carModel"]}, key=str.lower)
+
+        def option_tags(values):
+                return "".join(
+                        f'<option value="{escape(value)}">{escape(value)}</option>'
+                        for value in values
+                )
+
+        sender_note = (
+                "Messages go out from the Gravity Insurance business number through the WhatsApp "
+                "Cloud API. Both bulk templates must be approved in the WhatsApp Manager first."
+                if cloud_api_configured() else
+                "The WhatsApp Cloud API is not configured on this server, so each send hands back a "
+                "wa.me link to open by hand instead."
+        )
+
+        return (
+                '<div class="card">'
+                '<h2>Send Bulk Quote</h2>'
+                f'<p class="sender-note">{escape(sender_note)}</p>'
+                '<div class="send-quote-toolbar">'
+                '<label class="file-upload-label" for="bulkCampaignFile">Upload Campaign Image'
+                '<input type="file" id="bulkCampaignFile" accept=".png,.jpg,.jpeg" />'
+                '</label>'
+                '<input type="text" id="bulkCampaignTitle" class="campaign-title-input" '
+                'placeholder="Campaign name (optional)" />'
+                '<span id="bulkUploadStatus" class="import-status"></span>'
+                '</div>'
+                '<div id="bulkUploadError" class="form-error is-hidden"></div>'
+                '<div id="bulkCampaignList" class="campaign-list"></div>'
+                '</div>'
+                '<div class="card">'
+                '<h2>Filter Leads</h2>'
+                '<form class="filter-form" onsubmit="return false;">'
+                '<label>Vehicle Type'
+                f'<select id="bulkSegment"><option value="">All</option>{option_tags(segment_options)}</select>'
+                '</label>'
+                '<label>Brand'
+                f'<select id="bulkBrand"><option value="">All</option>{option_tags(brand_options)}</select>'
+                '</label>'
+                '<label>Model'
+                f'<select id="bulkModel"><option value="">All</option>{option_tags(model_options)}</select>'
+                '</label>'
+                '<label>Search'
+                '<input type="text" id="bulkSearch" placeholder="Name or mobile number" />'
+                '</label>'
+                '<div class="filter-actions">'
+                '<button id="bulkClearFilters" class="edit-btn" type="button">Clear</button>'
+                '</div>'
+                '</form>'
+                '</div>'
+                '<div class="card">'
+                '<div class="send-quote-controls">'
+                '<div class="selection-bar">'
+                '<span id="bulkSelectionCount">Selected: 0 Leads</span>'
+                '<button id="bulkSendBtn" class="save-customer-btn" type="button" disabled>Send Bulk Quote</button>'
+                '</div>'
+                '</div>'
+                '<div class="table-scroll">'
+                '<table id="bulkLeadsTable">'
+                '<thead><tr>'
+                '<th><input type="checkbox" id="bulkSelectAll" aria-label="Select all" /></th>'
+                '<th>Name</th><th>Mobile Number</th><th>Vehicle Type</th>'
+                '<th>Brand</th><th>Model</th><th>Status</th>'
+                '</tr></thead>'
+                '<tbody id="bulkLeadsBody"><tr><td colspan="7">Loading leads...</td></tr></tbody>'
+                '</table>'
+                '</div>'
+                '</div>'
+                '<div class="card">'
+                '<h2>Bulk Send History</h2>'
+                '<div class="table-scroll">'
+                '<table id="bulkSentTable">'
+                '<thead><tr>'
+                '<th>Name</th><th>Mobile Number</th><th>Vehicle</th>'
+                '<th>Campaign</th><th>Status</th><th>Sent Date/Time</th>'
+                '</tr></thead>'
+                '<tbody id="bulkSentBody"><tr><td colspan="6">No bulk messages sent yet.</td></tr></tbody>'
+                '</table>'
+                '</div>'
+                '</div>'
+                '<div id="bulkConfirmModal" class="modal-overlay is-hidden">'
+                '<div class="modal-box">'
+                '<h3 id="bulkConfirmText">Send this campaign?</h3>'
+                '<div class="modal-actions">'
+                '<button id="bulkCancelBtn" class="delete-btn" type="button">Cancel</button>'
+                '<button id="bulkConfirmBtn" class="save-customer-btn" type="button">Send</button>'
+                '</div>'
+                '</div>'
+                '</div>'
+                '<div id="bulkProgressModal" class="modal-overlay is-hidden">'
+                '<div class="modal-box">'
+                '<h3>Sending...</h3>'
+                '<div class="progress-bar-track"><div id="bulkProgressBar" class="progress-bar-fill"></div></div>'
+                '<p id="bulkProgressText">0 / 0 Sent</p>'
+                '<div id="bulkQueueCurrent" class="send-queue-current"></div>'
+                '<div class="modal-actions">'
+                '<button id="bulkCloseProgressBtn" class="edit-btn" type="button">Done</button>'
+                '</div>'
+                '</div>'
+                '</div>'
+                '<div id="toastContainer" class="toast-container"></div>'
+                '<script>' + BULK_QUOTE_SCRIPT + '</script>'
+        )
+
+
+BULK_QUOTE_SCRIPT = r"""
+(function () {
+        var state = {
+                leads: [],
+                selectedIds: new Set(),
+                campaigns: [],
+                campaignId: "",
+                queue: [],
+                queueIndex: 0,
+                sentCount: 0,
+                failedCount: 0,
+                rowStatus: {}
+        };
+
+        var leadsBody = document.getElementById("bulkLeadsBody");
+        var sentBody = document.getElementById("bulkSentBody");
+        var campaignList = document.getElementById("bulkCampaignList");
+        var selectAll = document.getElementById("bulkSelectAll");
+        var selectionCount = document.getElementById("bulkSelectionCount");
+        var sendBtn = document.getElementById("bulkSendBtn");
+        var segmentSelect = document.getElementById("bulkSegment");
+        var brandSelect = document.getElementById("bulkBrand");
+        var modelSelect = document.getElementById("bulkModel");
+        var searchInput = document.getElementById("bulkSearch");
+        var clearFilters = document.getElementById("bulkClearFilters");
+        var fileInput = document.getElementById("bulkCampaignFile");
+        var titleInput = document.getElementById("bulkCampaignTitle");
+        var uploadStatus = document.getElementById("bulkUploadStatus");
+        var uploadError = document.getElementById("bulkUploadError");
+        var confirmModal = document.getElementById("bulkConfirmModal");
+        var confirmText = document.getElementById("bulkConfirmText");
+        var confirmBtn = document.getElementById("bulkConfirmBtn");
+        var cancelBtn = document.getElementById("bulkCancelBtn");
+        var progressModal = document.getElementById("bulkProgressModal");
+        var progressBar = document.getElementById("bulkProgressBar");
+        var progressText = document.getElementById("bulkProgressText");
+        var queueCurrent = document.getElementById("bulkQueueCurrent");
+        var closeProgressBtn = document.getElementById("bulkCloseProgressBtn");
+        var toastContainer = document.getElementById("toastContainer");
+
+        function showToast(type, message) {
+                var toast = document.createElement("div");
+                toast.className = "toast toast-" + type;
+                toast.textContent = message;
+                toastContainer.appendChild(toast);
+                setTimeout(function () {
+                        toast.classList.add("toast-fade");
+                        setTimeout(function () { toast.remove(); }, 400);
+                }, 4000);
+        }
+
+        function escapeHtml(value) {
+                var div = document.createElement("div");
+                div.textContent = String(value == null ? "" : value);
+                return div.innerHTML;
+        }
+
+        function statusClass(status) {
+                return "status-badge status-" + String(status || "pending").toLowerCase();
+        }
+
+        function getFilteredLeads() {
+                var segment = segmentSelect.value.toLowerCase();
+                var brand = brandSelect.value.toLowerCase();
+                var model = modelSelect.value.toLowerCase();
+                var search = searchInput.value.trim().toLowerCase();
+
+                return state.leads.filter(function (lead) {
+                        if (segment && lead.segment.toLowerCase() !== segment) return false;
+                        if (brand && lead.carBrand.toLowerCase() !== brand) return false;
+                        if (model && lead.carModel.toLowerCase() !== model) return false;
+                        if (search) {
+                                var haystack = (lead.name + " " + lead.rawMobile + " " + lead.carModel).toLowerCase();
+                                if (haystack.indexOf(search) === -1) return false;
+                        }
+                        return true;
+                });
+        }
+
+        function renderLeads() {
+                var leads = getFilteredLeads();
+                if (!leads.length) {
+                        leadsBody.innerHTML = '<tr><td colspan="7">No leads match these filters.</td></tr>';
+                } else {
+                        leadsBody.innerHTML = leads.map(function (lead) {
+                                var checked = state.selectedIds.has(lead.id) ? " checked" : "";
+                                var disabled = lead.valid ? "" : " disabled";
+                                var status = lead.valid
+                                        ? (state.rowStatus[lead.id] || "Pending")
+                                        : "Invalid";
+                                return "<tr>" +
+                                        '<td><input type="checkbox" class="bulk-row-check" data-id="' +
+                                        escapeHtml(lead.id) + '"' + checked + disabled + " /></td>" +
+                                        "<td>" + escapeHtml(lead.name) + "</td>" +
+                                        "<td>" + escapeHtml(lead.rawMobile) + "</td>" +
+                                        "<td>" + escapeHtml(lead.segment) + "</td>" +
+                                        "<td>" + escapeHtml(lead.carBrand) + "</td>" +
+                                        "<td>" + escapeHtml(lead.carModel) + "</td>" +
+                                        '<td><span class="' + statusClass(status) + '">' + escapeHtml(status) + "</span></td>" +
+                                        "</tr>";
+                        }).join("");
+                }
+
+                var selectable = leads.filter(function (lead) { return lead.valid; });
+                selectAll.checked = selectable.length > 0 && selectable.every(function (lead) {
+                        return state.selectedIds.has(lead.id);
+                });
+                updateSelection();
+        }
+
+        function updateSelection() {
+                var count = state.selectedIds.size;
+                selectionCount.textContent = "Selected: " + count + " Lead" + (count === 1 ? "" : "s");
+                sendBtn.disabled = count === 0;
+        }
+
+        function renderCampaigns() {
+                var tiles = ['<label class="campaign-tile' + (state.campaignId ? "" : " is-selected") + '">' +
+                        '<input type="radio" name="bulkCampaign" value=""' +
+                        (state.campaignId ? "" : " checked") + " />" +
+                        '<span class="campaign-tile-text">Text only<br /><small>No image</small></span>' +
+                        "</label>"];
+
+                tiles = tiles.concat(state.campaigns.map(function (campaign) {
+                        var selected = campaign.id === state.campaignId;
+                        return '<label class="campaign-tile' + (selected ? " is-selected" : "") + '">' +
+                                '<input type="radio" name="bulkCampaign" value="' + escapeHtml(campaign.id) + '"' +
+                                (selected ? " checked" : "") + " />" +
+                                '<img src="' + escapeHtml(campaign.url) + '" alt="' + escapeHtml(campaign.title) + '" />' +
+                                '<span class="campaign-tile-text">' + escapeHtml(campaign.title) +
+                                "<br /><small>" + escapeHtml(campaign.uploadedAt) + "</small></span>" +
+                                '<button type="button" class="delete-btn campaign-delete" data-id="' +
+                                escapeHtml(campaign.id) + '">Delete</button>' +
+                                "</label>";
+                }));
+
+                campaignList.innerHTML = tiles.join("");
+        }
+
+        function renderSent(rows) {
+                if (!rows.length) {
+                        sentBody.innerHTML = '<tr><td colspan="6">No bulk messages sent yet.</td></tr>';
+                        return;
+                }
+                sentBody.innerHTML = rows.map(function (row) {
+                        var status = row.status || "Failed";
+                        var title = row.error ? ' title="' + escapeHtml(row.error) + '"' : "";
+                        return "<tr>" +
+                                "<td>" + escapeHtml(row.name) + "</td>" +
+                                "<td>" + escapeHtml(row.mobileNumber) + "</td>" +
+                                "<td>" + escapeHtml(row.vehicle) + "</td>" +
+                                "<td>" + escapeHtml(row.campaign) + "</td>" +
+                                '<td><span class="' + statusClass(status) + '"' + title + ">" +
+                                escapeHtml(status) + "</span></td>" +
+                                "<td>" + escapeHtml(row.sentAt) + "</td>" +
+                                "</tr>";
+                }).join("");
+        }
+
+        function loadSent() {
+                fetch("/api/bulk-quote/sent-rows")
+                        .then(function (response) { return response.json(); })
+                        .then(function (data) { renderSent(data.rows || []); })
+                        .catch(function () { /* history is not worth a toast */ });
+        }
+
+        [segmentSelect, brandSelect, modelSelect].forEach(function (control) {
+                control.addEventListener("change", renderLeads);
+        });
+        searchInput.addEventListener("input", renderLeads);
+
+        clearFilters.addEventListener("click", function () {
+                segmentSelect.value = "";
+                brandSelect.value = "";
+                modelSelect.value = "";
+                searchInput.value = "";
+                renderLeads();
+        });
+
+        leadsBody.addEventListener("change", function (event) {
+                var checkbox = event.target.closest(".bulk-row-check");
+                if (!checkbox) return;
+                var id = checkbox.getAttribute("data-id");
+                if (checkbox.checked) {
+                        state.selectedIds.add(id);
+                } else {
+                        state.selectedIds.delete(id);
+                }
+                updateSelection();
+        });
+
+        selectAll.addEventListener("change", function () {
+                // Select-all applies to the current filter only, so an agent who
+                // narrowed to "Bus" cannot accidentally message every lead.
+                getFilteredLeads().forEach(function (lead) {
+                        if (!lead.valid) return;
+                        if (selectAll.checked) {
+                                state.selectedIds.add(lead.id);
+                        } else {
+                                state.selectedIds.delete(lead.id);
+                        }
+                });
+                renderLeads();
+        });
+
+        campaignList.addEventListener("click", function (event) {
+                var deleteBtn = event.target.closest(".campaign-delete");
+                if (!deleteBtn) return;
+                event.preventDefault();
+                if (!window.confirm("Delete this campaign image?")) return;
+                var id = deleteBtn.getAttribute("data-id");
+                fetch("/api/bulk-quote/delete-campaign", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ id: id })
+                })
+                        .then(function (response) { return response.json(); })
+                        .then(function (data) {
+                                if (!data.success) {
+                                        showToast("error", data.error || "Could not delete the image.");
+                                        return;
+                                }
+                                state.campaigns = state.campaigns.filter(function (c) { return c.id !== id; });
+                                if (state.campaignId === id) state.campaignId = "";
+                                renderCampaigns();
+                                showToast("success", "Campaign image deleted.");
+                        })
+                        .catch(function () { showToast("error", "Could not reach the server."); });
+        });
+
+        campaignList.addEventListener("change", function (event) {
+                if (event.target.name !== "bulkCampaign") return;
+                state.campaignId = event.target.value;
+                renderCampaigns();
+        });
+
+        fileInput.addEventListener("change", function () {
+                var file = fileInput.files && fileInput.files[0];
+                if (!file) return;
+
+                uploadError.classList.add("is-hidden");
+                uploadStatus.textContent = "Uploading " + file.name + "...";
+
+                var formData = new FormData();
+                formData.append("campaign_file", file);
+                formData.append("title", titleInput.value.trim());
+
+                fetch("/api/bulk-quote/upload", { method: "POST", body: formData })
+                        .then(function (response) {
+                                return response.json().then(function (data) { return data; });
+                        })
+                        .then(function (data) {
+                                if (!data.success) {
+                                        uploadStatus.textContent = "";
+                                        uploadError.textContent = data.error || "Upload failed.";
+                                        uploadError.classList.remove("is-hidden");
+                                        return;
+                                }
+                                state.campaigns.unshift(data.campaign);
+                                state.campaignId = data.campaign.id;
+                                renderCampaigns();
+                                uploadStatus.textContent = "Uploaded.";
+                                titleInput.value = "";
+                                showToast("success", "Campaign image ready to send.");
+                        })
+                        .catch(function () {
+                                uploadStatus.textContent = "";
+                                uploadError.textContent = "Upload failed. Please try again.";
+                                uploadError.classList.remove("is-hidden");
+                        })
+                        .finally(function () { fileInput.value = ""; });
+        });
+
+        sendBtn.addEventListener("click", function () {
+                var campaign = state.campaigns.filter(function (c) { return c.id === state.campaignId; })[0];
+                confirmText.textContent =
+                        "Send " + (campaign ? '"' + campaign.title + '"' : "the text message") +
+                        " to " + state.selectedIds.size + " lead(s) on WhatsApp?";
+                confirmModal.classList.remove("is-hidden");
+        });
+
+        cancelBtn.addEventListener("click", function () {
+                confirmModal.classList.add("is-hidden");
+        });
+
+        confirmBtn.addEventListener("click", function () {
+                confirmModal.classList.add("is-hidden");
+                state.queue = state.leads.filter(function (lead) {
+                        return lead.valid && state.selectedIds.has(lead.id);
+                });
+                state.queueIndex = 0;
+                state.sentCount = 0;
+                state.failedCount = 0;
+                progressModal.classList.remove("is-hidden");
+                progressBar.style.width = "0%";
+                renderQueueStep();
+        });
+
+        closeProgressBtn.addEventListener("click", function () {
+                progressModal.classList.add("is-hidden");
+                loadSent();
+        });
+
+        function renderQueueStep() {
+                var total = state.queue.length;
+                var processed = state.sentCount + state.failedCount;
+                progressBar.style.width = (total ? (processed / total) * 100 : 0) + "%";
+                progressText.textContent = processed + " / " + total + " Sent";
+
+                if (state.queueIndex >= total) {
+                        queueCurrent.innerHTML = "<p><strong>All done.</strong> " + state.sentCount +
+                                " sent, " + state.failedCount + " failed.</p>";
+                        showToast("success", state.sentCount + " message(s) sent, " + state.failedCount + " failed.");
+                        renderLeads();
+                        loadSent();
+                        return;
+                }
+
+                var lead = state.queue[state.queueIndex];
+                queueCurrent.innerHTML = "<p><strong>Sending to " + escapeHtml(lead.name) +
+                        "</strong> &middot; " + escapeHtml(lead.rawMobile) + "...</p>";
+
+                fetch("/api/bulk-quote/send", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ id: lead.id, campaignId: state.campaignId })
+                })
+                        .then(function (response) { return response.json(); })
+                        .then(function (data) {
+                                if (!data.success && data.waLink) {
+                                        // No Cloud API on this server: open a pre-filled chat and
+                                        // let the agent press Send.
+                                        window.open(data.waLink, "_blank", "noopener");
+                                        state.sentCount += 1;
+                                        state.rowStatus[lead.id] = "Sent";
+                                        return;
+                                }
+                                if (data.success) {
+                                        state.sentCount += 1;
+                                        state.rowStatus[lead.id] = "Sent";
+                                        state.selectedIds.delete(lead.id);
+                                } else {
+                                        state.failedCount += 1;
+                                        state.rowStatus[lead.id] = "Failed";
+                                        if (data.error) showToast("error", lead.name + ": " + data.error);
+                                }
+                        })
+                        .catch(function () {
+                                state.failedCount += 1;
+                                state.rowStatus[lead.id] = "Failed";
+                        })
+                        .finally(function () {
+                                state.queueIndex += 1;
+                                renderQueueStep();
+                        });
+        }
+
+        fetch("/api/bulk-quote/leads")
+                .then(function (response) { return response.json(); })
+                .then(function (data) {
+                        state.leads = data.leads || [];
+                        renderLeads();
+                })
+                .catch(function () {
+                        leadsBody.innerHTML = '<tr><td colspan="7">Could not load leads.</td></tr>';
+                });
+
+        fetch("/api/bulk-quote/campaigns")
+                .then(function (response) { return response.json(); })
+                .then(function (data) {
+                        state.campaigns = data.campaigns || [];
+                        renderCampaigns();
+                })
+                .catch(function () { renderCampaigns(); });
+
+        loadSent();
+})();
+"""
+
+
 class AppHandler(BaseHTTPRequestHandler):
         def get_current_user(self):
                 cookies = auth.parse_cookie_header(self.headers.get("Cookie", ""))
@@ -2965,6 +3715,31 @@ class AppHandler(BaseHTTPRequestHandler):
                 file_bytes = upload_item.get("content", b"")
                 payload, status_code = import_send_quote_file(filename, file_bytes, kind)
                 self.send_json_response(status_code, payload)
+
+        def handle_bulk_campaign_upload(self):
+                content_length = int(self.headers.get("Content-Length", "0"))
+                content_type = self.headers.get("Content-Type", "")
+                form_fields = parse_multipart_form_data(self.rfile.read(content_length), content_type)
+
+                upload_item = form_fields.get("campaign_file")
+                if not isinstance(upload_item, dict):
+                        self.send_json_response(400, {"success": False, "error": "No image was uploaded."})
+                        return
+
+                title = form_fields.get("title")
+                payload, status_code = import_bulk_campaign_image(
+                        upload_item.get("filename", ""),
+                        upload_item.get("content", b""),
+                        title if isinstance(title, str) else "",
+                )
+                self.send_json_response(status_code, payload)
+
+        def read_json_body(self):
+                try:
+                        length = int(self.headers.get("Content-Length", "0"))
+                        return json.loads(self.rfile.read(length).decode("utf-8"))
+                except (ValueError, UnicodeDecodeError, OSError):
+                        return {}
 
         def handle_send_quote_status(self, kind):
                 content_length = int(self.headers.get("Content-Length", "0"))
@@ -3068,6 +3843,31 @@ class AppHandler(BaseHTTPRequestHandler):
                                 data = {}
                         payload, status_code = send_chat_reply(number, data.get("message"))
                         self.send_json_response(status_code, payload)
+                        return
+
+                if self.path == "/api/bulk-quote/upload":
+                        self.handle_bulk_campaign_upload()
+                        return
+
+                if self.path == "/api/bulk-quote/send":
+                        data = self.read_json_body()
+                        payload, status_code = send_bulk_quote_to_lead(
+                                str(data.get("id", "")), str(data.get("campaignId", "") or "")
+                        )
+                        self.send_json_response(status_code, payload)
+                        return
+
+                if self.path == "/api/bulk-quote/delete-campaign":
+                        data = self.read_json_body()
+                        campaign_id = str(data.get("id", ""))
+                        if not campaigns.is_campaign_id(campaign_id):
+                                self.send_json_response(400, {"success": False, "error": "Invalid campaign."})
+                                return
+                        removed = campaigns.delete_campaign(campaign_id)
+                        self.send_json_response(
+                                200 if removed else 404,
+                                {"success": removed, "error": "" if removed else "Campaign not found."},
+                        )
                         return
 
                 send_link_action = get_send_link_api_action(self.path)
@@ -3238,6 +4038,37 @@ class AppHandler(BaseHTTPRequestHandler):
                         self.send_json_response(status_code, payload)
                         return
 
+                if parsed.path == "/api/bulk-quote/leads":
+                        self.send_json_response(200, {"leads": load_bulk_leads()})
+                        return
+
+                if parsed.path == "/api/bulk-quote/campaigns":
+                        self.send_json_response(200, {
+                                "campaigns": [
+                                        build_campaign_payload(campaign)
+                                        for campaign in campaigns.load_campaigns()
+                                ],
+                        })
+                        return
+
+                if parsed.path == "/api/bulk-quote/sent-rows":
+                        self.send_json_response(200, {"rows": load_bulk_sent_history()})
+                        return
+
+                if parsed.path.startswith("/campaign-image/"):
+                        image_path = get_campaign_image_path(parsed.path[len("/campaign-image/"):])
+                        if image_path is None:
+                                self.send_error(404, "Campaign image not found")
+                                return
+                        content_type = mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
+                        data = image_path.read_bytes()
+                        self.send_response(200)
+                        self.send_header("Content-type", content_type)
+                        self.send_header("Content-Length", str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data)
+                        return
+
                 send_link_action = get_send_link_api_action(parsed.path)
                 if send_link_action is not None:
                         kind, action = send_link_action
@@ -3298,6 +4129,7 @@ def render_with_template(page_content, user=None, active_path=""):
                 .replace("{{NAV_EXPIRY_CLASS}}", build_nav_class(active_path, "/expiry-alerts"))
                 .replace("{{NAV_SENDQUOTE_CLASS}}", build_nav_class(active_path, "/send-quote"))
                 .replace("{{NAV_SENDPAYMENT_CLASS}}", build_nav_class(active_path, "/send-payment-link"))
+                .replace("{{NAV_BULKQUOTE_CLASS}}", build_nav_class(active_path, "/bulk-quote"))
                 .replace("{{NAV_USERS_LINK}}", users_link)
                 .replace("{{NAV_AUTH_LINK}}", auth_link)
                 .replace("{{ENV_BANNER}}", build_env_banner())
@@ -3440,6 +4272,8 @@ def render_page(current_path, query_params, user=None):
                 page_content = build_send_quote_content("quote")
         if current_path == "/send-payment-link":
                 page_content = build_send_quote_content("payment")
+        if current_path == "/bulk-quote":
+                page_content = build_bulk_quote_content()
 
         return render_with_template(page_content, user, current_path)
 

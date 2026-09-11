@@ -152,6 +152,8 @@ def check_whatsapp(report):
                 ("GI_WA_TEMPLATE_PAYMENT", "payment_link_share"),
                 ("GI_WA_TEMPLATE_REMINDER", "policy_expiry_reminder"),
                 ("GI_WA_TEMPLATE_QUOTE_IMAGE", "quote_image_share"),
+                ("GI_WA_TEMPLATE_BULK_IMAGE", "bulk_offer_image"),
+                ("GI_WA_TEMPLATE_BULK_TEXT", "bulk_offer_text"),
         ):
                 value = os.environ.get(env_name, default)
                 report.add(OK, f"template {env_name.split('TEMPLATE_')[-1].lower()}", value)

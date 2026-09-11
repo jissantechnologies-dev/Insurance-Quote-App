@@ -624,7 +624,8 @@ pre {
     color: var(--muted);
 }
 
-.filter-form select {
+.filter-form select,
+.filter-form input[type="text"] {
     width: 100%;
     border: 1px solid rgba(101, 87, 169, 0.25);
     border-radius: 10px;
@@ -1306,4 +1307,66 @@ pre {
     font-weight: 700;
     letter-spacing: 0.04em;
     text-align: center;
+}
+
+/* Bulk quote: the saved campaign images, picked one at a time before a run. */
+.campaign-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 12px;
+    margin-top: 14px;
+}
+
+.campaign-tile {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+    border: 2px solid var(--card-border);
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.92);
+    cursor: pointer;
+}
+
+.campaign-tile.is-selected {
+    border-color: #f65195;
+    box-shadow: 0 10px 20px rgba(246, 81, 149, 0.18);
+}
+
+.campaign-tile img {
+    width: 100%;
+    height: 150px;
+    object-fit: cover;
+    border-radius: 10px;
+}
+
+.campaign-tile-text {
+    font-size: 0.85rem;
+    font-weight: 700;
+    word-break: break-word;
+}
+
+.campaign-tile-text small {
+    font-weight: 500;
+    color: var(--muted);
+}
+
+.campaign-delete {
+    align-self: flex-start;
+    padding: 4px 12px;
+    font-size: 0.78rem;
+}
+
+.campaign-title-input {
+    border: 1px solid rgba(101, 87, 169, 0.25);
+    border-radius: 10px;
+    padding: 9px 12px;
+    font-size: 0.92rem;
+    min-width: 200px;
+}
+
+/* A lead with no usable name or number can never be selected for a send. */
+.status-invalid {
+    background: linear-gradient(135deg, #94a3b8, #64748b);
 }

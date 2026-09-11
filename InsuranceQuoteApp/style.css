@@ -1370,3 +1370,16 @@ pre {
 .status-invalid {
     background: linear-gradient(135deg, #94a3b8, #64748b);
 }
+
+/* A card title with an action sitting beside it. */
+.card-heading-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.card-heading-row h2 {
+    margin: 0;
+}

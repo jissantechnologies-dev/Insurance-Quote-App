@@ -1766,6 +1766,17 @@ def send_template_message(number, template_name, values):
         if not number:
                 return False, "No mobile number.", ""
 
+        # A template with no variables takes no body component at all.
+        components = []
+        if values:
+                components.append({
+                        "type": "body",
+                        "parameters": [
+                                {"type": "text", "text": " ".join(str(v or "").split())}
+                                for v in values
+                        ],
+                })
+
         payload = {
                 "messaging_product": "whatsapp",
                 "to": number,
@@ -1773,13 +1784,7 @@ def send_template_message(number, template_name, values):
                 "template": {
                         "name": template_name,
                         "language": {"code": WA_TEMPLATE_LANGUAGE},
-                        "components": [{
-                                "type": "body",
-                                "parameters": [
-                                        {"type": "text", "text": " ".join(str(v or "").split())}
-                                        for v in values
-                                ],
-                        }],
+                        "components": components,
                 },
         }
         request = Request(
@@ -2927,9 +2932,12 @@ def send_quote_for_row(row_id, kind="quote"):
 # leads already in the app, narrowed by vehicle type, brand and model.
 #
 # Both templates below must be approved in the WhatsApp Manager before a bulk
-# run will work, and both take a single body parameter, the customer's name:
-#   bulk_offer_image  - IMAGE header, body "Hello {{1}}, ..."
-#   bulk_offer_text   - text only,   body "Hello {{1}}, ..."
+# run will work. Neither takes any variable - the poster carries the offer and
+# the body is one fixed line:
+#   bulk_offer_image  - IMAGE header, body "Thanks - Gravity Insurance Team"
+#   bulk_offer_text   - no header,    body "Thanks - Gravity Insurance Team"
+# A template with no variables rejects any parameter sent for it, which is why
+# both sends below pass an empty parameter list.
 WA_TEMPLATE_BULK_IMAGE = os.environ.get("GI_WA_TEMPLATE_BULK_IMAGE", "bulk_offer_image")
 WA_TEMPLATE_BULK_TEXT = os.environ.get("GI_WA_TEMPLATE_BULK_TEXT", "bulk_offer_text")
 
@@ -2937,12 +2945,7 @@ BULK_SENT_PATH = paths.data_path("sent_bulk_quote.json")
 
 # The wa.me fallback text, used only when the Cloud API is not configured on
 # this server (local development). Templates carry their own wording.
-BULK_FALLBACK_MESSAGE = (
-        "Hello {name},\n\n"
-        "Gravity Insurance has a new offer on your {vehicle}.\n\n"
-        "Reply to this message and we will share your quote.\n\n"
-        "Thank you,\nGravity Insurance"
-)
+BULK_FALLBACK_MESSAGE = "Thanks - Gravity Insurance Team"
 
 
 def load_bulk_sent_history():
@@ -2960,12 +2963,25 @@ def record_bulk_send(entry):
         return entry
 
 
-def build_bulk_lead(customer):
-        """One lead flattened into what the bulk page needs.
+def clear_bulk_sent_history():
+        """Empty the bulk history. Returns the number of entries removed.
 
-        `id` is the normalised mobile number: the leads file has no stable key
-        of its own, and a row's position shifts as leads are added or
-        converted, so an index would send to the wrong person."""
+        The file is rewritten empty rather than deleted, so the next send
+        appends to a file that is already there and readable."""
+        removed = len(load_bulk_sent_history())
+        paths.ensure_data_dir()
+        with BULK_SENT_PATH.open("w", encoding="utf-8") as file:
+                json.dump([], file, indent=4)
+        return removed
+
+
+def build_bulk_recipient(customer, list_name):
+        """One customer flattened into what the bulk page needs.
+
+        `id` is the normalised mobile number: neither the leads file nor the
+        Excel sheet has a stable key of its own, and a row's position shifts as
+        people are added or converted, so an index would send to the wrong
+        person."""
         # The leads file was written with a BOM, which would otherwise ride
         # along into the name parameter of the WhatsApp template.
         name = str(get_customer_value(customer, "name")).lstrip("﻿").strip()
@@ -2975,60 +2991,84 @@ def build_bulk_lead(customer):
         return {
                 "id": mobile or raw_mobile,
                 "name": name,
+                "list": list_name,
                 "mobileNumber": mobile,
                 "rawMobile": raw_mobile,
                 "carType": car_type,
                 "segment": classify_vehicle_segment(car_type),
                 "carBrand": str(get_customer_value(customer, "carBrand")).strip(),
                 "carModel": str(get_customer_value(customer, "carModel")).strip(),
+                "policyExpiryDate": str(
+                        get_customer_value(customer, "policyExpiryDate", "PolicyExpiryDate")
+                ).strip(),
                 "valid": bool(name and mobile),
         }
 
 
-def load_bulk_leads():
-        """Every lead, de-duplicated by mobile number.
+BULK_LIST_ACTIVE = "Active Client"
+BULK_LIST_LEAD = "Lead"
 
-        The same person can sit in the leads file twice (re-enquired months
-        apart, say); sending one offer to them twice in a single run is a
-        visible mistake, so only the first row of each number survives."""
-        leads = []
+
+def load_bulk_recipients():
+        """Everyone the page can message: active clients and leads alike.
+
+        De-duplicated by mobile number. The same person can appear twice in one
+        file (re-enquired months apart, say) and can also sit in both lists at
+        once - a lead who was converted but never removed. Sending them the
+        same offer twice in one run is a visible mistake, so only the first row
+        of each number survives. Active clients are read first, so anyone in
+        both lists is shown as the client they became, not the lead they
+        were."""
+        recipients = []
         seen = set()
-        for customer in load_new_customers():
-                lead = build_bulk_lead(customer)
-                if lead["id"]:
-                        if lead["id"] in seen:
-                                continue
-                        seen.add(lead["id"])
-                leads.append(lead)
-        return leads
+        sources = (
+                (load_customers(), BULK_LIST_ACTIVE),
+                (load_new_customers_from_excel(), BULK_LIST_ACTIVE),
+                (load_new_customers(), BULK_LIST_LEAD),
+        )
+        for customers, list_name in sources:
+                for customer in customers:
+                        recipient = build_bulk_recipient(customer, list_name)
+                        if recipient["id"]:
+                                if recipient["id"] in seen:
+                                        continue
+                                seen.add(recipient["id"])
+                        recipients.append(recipient)
+        return recipients
 
 
-def find_bulk_lead(lead_id):
-        return next((lead for lead in load_bulk_leads() if lead["id"] == lead_id), None)
+def find_bulk_recipient(recipient_id):
+        return next(
+                (person for person in load_bulk_recipients() if person["id"] == recipient_id),
+                None,
+        )
 
 
-def filter_bulk_leads(leads, segment="", brand="", model="", search=""):
-        """Narrow the leads list the way the page's controls do.
+def filter_bulk_recipients(recipients, list_name="", segment="", brand="", model="", search=""):
+        """Narrow the recipient list the way the page's controls do.
 
         Filtering lives here as well as in the browser so the same rule can be
         checked without a page."""
+        list_value = str(list_name or "").strip().lower()
         segment_value = str(segment or "").strip().lower()
         brand_value = str(brand or "").strip().lower()
         model_value = str(model or "").strip().lower()
         search_value = str(search or "").strip().lower()
 
         matched = []
-        for lead in leads:
-                if segment_value and lead["segment"].lower() != segment_value:
+        for person in recipients:
+                if list_value and person["list"].lower() != list_value:
                         continue
-                if brand_value and lead["carBrand"].lower() != brand_value:
+                if segment_value and person["segment"].lower() != segment_value:
                         continue
-                if model_value and lead["carModel"].lower() != model_value:
+                if brand_value and person["carBrand"].lower() != brand_value:
                         continue
-                haystack = f"{lead['name']} {lead['rawMobile']} {lead['carModel']}".lower()
+                if model_value and person["carModel"].lower() != model_value:
+                        continue
+                haystack = f"{person['name']} {person['rawMobile']} {person['carModel']}".lower()
                 if search_value and search_value not in haystack:
                         continue
-                matched.append(lead)
+                matched.append(person)
         return matched
 
 
@@ -3055,8 +3095,8 @@ def get_campaign_media_id(campaign):
         return media_id, ""
 
 
-def send_bulk_campaign_image(lead, campaign):
-        """Send the campaign image to one lead. Returns (ok, error, wamid).
+def send_bulk_campaign_image(person, campaign):
+        """Send the campaign image to one recipient. Returns (ok, error, wamid).
 
         A cached media id that Meta has since expired looks like any other send
         failure, so one retry clears the cache and re-uploads before giving
@@ -3067,14 +3107,14 @@ def send_bulk_campaign_image(lead, campaign):
                         return False, error, ""
 
                 ok, wamid, error = whatsapp_media.send_image_template(
-                        lead["mobileNumber"], WA_TEMPLATE_BULK_IMAGE, media_id, [lead["name"]],
+                        person["mobileNumber"], WA_TEMPLATE_BULK_IMAGE, media_id, [],
                         WA_TOKEN, WA_PHONE_NUMBER_ID,
                         language=WA_TEMPLATE_LANGUAGE, graph_version=WA_GRAPH_VERSION,
                 )
                 if ok:
                         chat.save_message(
-                                wamid, lead["mobileNumber"], "out",
-                                f"[{campaign['title']}] campaign image sent to {lead['name']}",
+                                wamid, person["mobileNumber"], "out",
+                                f"[{campaign['title']}] campaign image sent to {person['name']}",
                                 msg_type="image", media_id=media_id, status="sent",
                         )
                         return True, "", wamid
@@ -3087,15 +3127,15 @@ def send_bulk_campaign_image(lead, campaign):
         return False, "The campaign image could not be sent.", ""
 
 
-def send_bulk_quote_to_lead(lead_id, campaign_id=""):
-        """Send one lead their copy of the campaign. Returns (payload, status).
+def send_bulk_quote_to_recipient(recipient_id, campaign_id=""):
+        """Send one person their copy of the campaign. Returns (payload, status).
 
         Every attempt is written to the history file, successes and failures
         alike - on a bulk run, knowing who was *not* reached matters as much as
         knowing who was."""
-        lead = find_bulk_lead(lead_id)
-        if lead is None:
-                return {"success": False, "error": "Lead not found."}, 404
+        person = find_bulk_recipient(recipient_id)
+        if person is None:
+                return {"success": False, "error": "Recipient not found."}, 404
 
         campaign = None
         if campaign_id:
@@ -3104,17 +3144,18 @@ def send_bulk_quote_to_lead(lead_id, campaign_id=""):
                         return {"success": False, "error": "Campaign image not found."}, 404
 
         entry = {
-                "name": lead["name"],
-                "mobileNumber": lead["rawMobile"],
-                "vehicle": " ".join(part for part in (lead["carBrand"], lead["carModel"]) if part),
+                "name": person["name"],
+                "list": person["list"],
+                "mobileNumber": person["rawMobile"],
+                "vehicle": " ".join(part for part in (person["carBrand"], person["carModel"]) if part),
                 "campaign": campaign["title"] if campaign else "Text only",
                 "status": "Failed",
                 "error": "",
                 "sentAt": datetime.now(IST).strftime("%Y-%m-%d %I:%M %p"),
         }
 
-        if not lead["valid"]:
-                entry["error"] = "Lead has no usable name or mobile number."
+        if not person["valid"]:
+                entry["error"] = "No usable name or mobile number."
                 record_bulk_send(entry)
                 return {"success": False, "status": "Failed", "error": entry["error"]}, 200
 
@@ -3128,20 +3169,16 @@ def send_bulk_quote_to_lead(lead_id, campaign_id=""):
                         "status": "Failed",
                         "error": entry["error"],
                         "waLink": build_whatsapp_link(
-                                lead["mobileNumber"],
-                                BULK_FALLBACK_MESSAGE.format(
-                                        name=lead["name"],
-                                        vehicle=(lead["carModel"] or lead["carType"] or "vehicle"),
-                                ),
+                                person["mobileNumber"], BULK_FALLBACK_MESSAGE
                         ),
                 }, 200
 
         if campaign is None:
                 ok, error, _ = send_template_message(
-                        lead["mobileNumber"], WA_TEMPLATE_BULK_TEXT, [lead["name"]]
+                        person["mobileNumber"], WA_TEMPLATE_BULK_TEXT, []
                 )
         else:
-                ok, error, _ = send_bulk_campaign_image(lead, campaign)
+                ok, error, _ = send_bulk_campaign_image(person, campaign)
 
         if not ok:
                 entry["error"] = error
@@ -3178,10 +3215,14 @@ def get_campaign_image_path(campaign_id):
 
 
 def build_bulk_quote_content():
-        leads = load_bulk_leads()
-        segment_options = sorted({lead["segment"] for lead in leads if lead["segment"]})
-        brand_options = sorted({lead["carBrand"] for lead in leads if lead["carBrand"]}, key=str.lower)
-        model_options = sorted({lead["carModel"] for lead in leads if lead["carModel"]}, key=str.lower)
+        recipients = load_bulk_recipients()
+        list_options = [
+                name for name in (BULK_LIST_ACTIVE, BULK_LIST_LEAD)
+                if any(person["list"] == name for person in recipients)
+        ]
+        segment_options = sorted({p["segment"] for p in recipients if p["segment"]})
+        brand_options = sorted({p["carBrand"] for p in recipients if p["carBrand"]}, key=str.lower)
+        model_options = sorted({p["carModel"] for p in recipients if p["carModel"]}, key=str.lower)
 
         def option_tags(values):
                 return "".join(
@@ -3213,8 +3254,11 @@ def build_bulk_quote_content():
                 '<div id="bulkCampaignList" class="campaign-list"></div>'
                 '</div>'
                 '<div class="card">'
-                '<h2>Filter Leads</h2>'
+                '<h2>Filter Recipients</h2>'
                 '<form class="filter-form" onsubmit="return false;">'
+                '<label>List'
+                f'<select id="bulkList"><option value="">All</option>{option_tags(list_options)}</select>'
+                '</label>'
                 '<label>Vehicle Type'
                 f'<select id="bulkSegment"><option value="">All</option>{option_tags(segment_options)}</select>'
                 '</label>'
@@ -3235,7 +3279,7 @@ def build_bulk_quote_content():
                 '<div class="card">'
                 '<div class="send-quote-controls">'
                 '<div class="selection-bar">'
-                '<span id="bulkSelectionCount">Selected: 0 Leads</span>'
+                '<span id="bulkSelectionCount">Selected: 0 Contacts</span>'
                 '<button id="bulkSendBtn" class="save-customer-btn" type="button" disabled>Send Bulk Quote</button>'
                 '</div>'
                 '</div>'
@@ -3243,22 +3287,25 @@ def build_bulk_quote_content():
                 '<table id="bulkLeadsTable">'
                 '<thead><tr>'
                 '<th><input type="checkbox" id="bulkSelectAll" aria-label="Select all" /></th>'
-                '<th>Name</th><th>Mobile Number</th><th>Vehicle Type</th>'
+                '<th>Name</th><th>List</th><th>Mobile Number</th><th>Vehicle Type</th>'
                 '<th>Brand</th><th>Model</th><th>Status</th>'
                 '</tr></thead>'
-                '<tbody id="bulkLeadsBody"><tr><td colspan="7">Loading leads...</td></tr></tbody>'
+                '<tbody id="bulkLeadsBody"><tr><td colspan="8">Loading contacts...</td></tr></tbody>'
                 '</table>'
                 '</div>'
                 '</div>'
                 '<div class="card">'
+                '<div class="card-heading-row">'
                 '<h2>Bulk Send History</h2>'
+                '<button id="bulkClearHistoryBtn" class="delete-btn" type="button">Clear History</button>'
+                '</div>'
                 '<div class="table-scroll">'
                 '<table id="bulkSentTable">'
                 '<thead><tr>'
-                '<th>Name</th><th>Mobile Number</th><th>Vehicle</th>'
+                '<th>Name</th><th>List</th><th>Mobile Number</th><th>Vehicle</th>'
                 '<th>Campaign</th><th>Status</th><th>Sent Date/Time</th>'
                 '</tr></thead>'
-                '<tbody id="bulkSentBody"><tr><td colspan="6">No bulk messages sent yet.</td></tr></tbody>'
+                '<tbody id="bulkSentBody"><tr><td colspan="7">No bulk messages sent yet.</td></tr></tbody>'
                 '</table>'
                 '</div>'
                 '</div>'
@@ -3290,7 +3337,7 @@ def build_bulk_quote_content():
 BULK_QUOTE_SCRIPT = r"""
 (function () {
         var state = {
-                leads: [],
+                recipients: [],
                 selectedIds: new Set(),
                 campaigns: [],
                 campaignId: "",
@@ -3307,6 +3354,7 @@ BULK_QUOTE_SCRIPT = r"""
         var selectAll = document.getElementById("bulkSelectAll");
         var selectionCount = document.getElementById("bulkSelectionCount");
         var sendBtn = document.getElementById("bulkSendBtn");
+        var listSelect = document.getElementById("bulkList");
         var segmentSelect = document.getElementById("bulkSegment");
         var brandSelect = document.getElementById("bulkBrand");
         var modelSelect = document.getElementById("bulkModel");
@@ -3325,6 +3373,7 @@ BULK_QUOTE_SCRIPT = r"""
         var progressText = document.getElementById("bulkProgressText");
         var queueCurrent = document.getElementById("bulkQueueCurrent");
         var closeProgressBtn = document.getElementById("bulkCloseProgressBtn");
+        var clearHistoryBtn = document.getElementById("bulkClearHistoryBtn");
         var toastContainer = document.getElementById("toastContainer");
 
         function showToast(type, message) {
@@ -3348,13 +3397,15 @@ BULK_QUOTE_SCRIPT = r"""
                 return "status-badge status-" + String(status || "pending").toLowerCase();
         }
 
-        function getFilteredLeads() {
+        function getFilteredRecipients() {
+                var list = listSelect.value.toLowerCase();
                 var segment = segmentSelect.value.toLowerCase();
                 var brand = brandSelect.value.toLowerCase();
                 var model = modelSelect.value.toLowerCase();
                 var search = searchInput.value.trim().toLowerCase();
 
-                return state.leads.filter(function (lead) {
+                return state.recipients.filter(function (lead) {
+                        if (list && lead.list.toLowerCase() !== list) return false;
                         if (segment && lead.segment.toLowerCase() !== segment) return false;
                         if (brand && lead.carBrand.toLowerCase() !== brand) return false;
                         if (model && lead.carModel.toLowerCase() !== model) return false;
@@ -3367,9 +3418,9 @@ BULK_QUOTE_SCRIPT = r"""
         }
 
         function renderLeads() {
-                var leads = getFilteredLeads();
+                var leads = getFilteredRecipients();
                 if (!leads.length) {
-                        leadsBody.innerHTML = '<tr><td colspan="7">No leads match these filters.</td></tr>';
+                        leadsBody.innerHTML = '<tr><td colspan="8">No contacts match these filters.</td></tr>';
                 } else {
                         leadsBody.innerHTML = leads.map(function (lead) {
                                 var checked = state.selectedIds.has(lead.id) ? " checked" : "";
@@ -3381,6 +3432,7 @@ BULK_QUOTE_SCRIPT = r"""
                                         '<td><input type="checkbox" class="bulk-row-check" data-id="' +
                                         escapeHtml(lead.id) + '"' + checked + disabled + " /></td>" +
                                         "<td>" + escapeHtml(lead.name) + "</td>" +
+                                        "<td>" + escapeHtml(lead.list) + "</td>" +
                                         "<td>" + escapeHtml(lead.rawMobile) + "</td>" +
                                         "<td>" + escapeHtml(lead.segment) + "</td>" +
                                         "<td>" + escapeHtml(lead.carBrand) + "</td>" +
@@ -3399,8 +3451,34 @@ BULK_QUOTE_SCRIPT = r"""
 
         function updateSelection() {
                 var count = state.selectedIds.size;
-                selectionCount.textContent = "Selected: " + count + " Lead" + (count === 1 ? "" : "s");
+                var campaign = state.campaigns.filter(function (c) { return c.id === state.campaignId; })[0];
+                selectionCount.textContent = "Selected: " + count + " Contact" + (count === 1 ? "" : "s") +
+                        " · sending " + (campaign ? campaign.title : "text only, no image");
                 sendBtn.disabled = count === 0;
+        }
+
+        function rememberCampaign(id) {
+                try {
+                        window.localStorage.setItem("bulkCampaignId", id || "");
+                } catch (err) {
+                        // Private windows and blocked site data both throw here;
+                        // the page works fine without the memory.
+                }
+        }
+
+        function pickDefaultCampaign(list) {
+                if (!list.length) return "";
+                var remembered = "";
+                try {
+                        remembered = window.localStorage.getItem("bulkCampaignId") || "";
+                } catch (err) {
+                        remembered = "";
+                }
+                if (remembered === "text") return "";
+                var stillThere = list.some(function (c) { return c.id === remembered; });
+                // Falling back to the newest image, not to text: an agent who
+                // uploaded a poster and came back to the page means to send it.
+                return stillThere ? remembered : list[0].id;
         }
 
         function renderCampaigns() {
@@ -3424,11 +3502,12 @@ BULK_QUOTE_SCRIPT = r"""
                 }));
 
                 campaignList.innerHTML = tiles.join("");
+                updateSelection();
         }
 
         function renderSent(rows) {
                 if (!rows.length) {
-                        sentBody.innerHTML = '<tr><td colspan="6">No bulk messages sent yet.</td></tr>';
+                        sentBody.innerHTML = '<tr><td colspan="7">No bulk messages sent yet.</td></tr>';
                         return;
                 }
                 sentBody.innerHTML = rows.map(function (row) {
@@ -3436,6 +3515,7 @@ BULK_QUOTE_SCRIPT = r"""
                         var title = row.error ? ' title="' + escapeHtml(row.error) + '"' : "";
                         return "<tr>" +
                                 "<td>" + escapeHtml(row.name) + "</td>" +
+                                "<td>" + escapeHtml(row.list) + "</td>" +
                                 "<td>" + escapeHtml(row.mobileNumber) + "</td>" +
                                 "<td>" + escapeHtml(row.vehicle) + "</td>" +
                                 "<td>" + escapeHtml(row.campaign) + "</td>" +
@@ -3453,12 +3533,13 @@ BULK_QUOTE_SCRIPT = r"""
                         .catch(function () { /* history is not worth a toast */ });
         }
 
-        [segmentSelect, brandSelect, modelSelect].forEach(function (control) {
+        [listSelect, segmentSelect, brandSelect, modelSelect].forEach(function (control) {
                 control.addEventListener("change", renderLeads);
         });
         searchInput.addEventListener("input", renderLeads);
 
         clearFilters.addEventListener("click", function () {
+                listSelect.value = "";
                 segmentSelect.value = "";
                 brandSelect.value = "";
                 modelSelect.value = "";
@@ -3481,7 +3562,7 @@ BULK_QUOTE_SCRIPT = r"""
         selectAll.addEventListener("change", function () {
                 // Select-all applies to the current filter only, so an agent who
                 // narrowed to "Bus" cannot accidentally message every lead.
-                getFilteredLeads().forEach(function (lead) {
+                getFilteredRecipients().forEach(function (lead) {
                         if (!lead.valid) return;
                         if (selectAll.checked) {
                                 state.selectedIds.add(lead.id);
@@ -3520,6 +3601,7 @@ BULK_QUOTE_SCRIPT = r"""
         campaignList.addEventListener("change", function (event) {
                 if (event.target.name !== "bulkCampaign") return;
                 state.campaignId = event.target.value;
+                rememberCampaign(state.campaignId || "text");
                 renderCampaigns();
         });
 
@@ -3547,6 +3629,7 @@ BULK_QUOTE_SCRIPT = r"""
                                 }
                                 state.campaigns.unshift(data.campaign);
                                 state.campaignId = data.campaign.id;
+                                rememberCampaign(state.campaignId);
                                 renderCampaigns();
                                 uploadStatus.textContent = "Uploaded.";
                                 titleInput.value = "";
@@ -3560,11 +3643,33 @@ BULK_QUOTE_SCRIPT = r"""
                         .finally(function () { fileInput.value = ""; });
         });
 
+        clearHistoryBtn.addEventListener("click", function () {
+                // The history is the only record of who was messaged, so this
+                // asks before wiping it.
+                if (!window.confirm("Delete the whole bulk send history? This cannot be undone.")) {
+                        return;
+                }
+                fetch("/api/bulk-quote/clear-history", { method: "POST" })
+                        .then(function (response) { return response.json(); })
+                        .then(function (data) {
+                                if (!data.success) {
+                                        showToast("error", data.error || "Could not clear the history.");
+                                        return;
+                                }
+                                renderSent([]);
+                                showToast("success", "Cleared " + data.removed + " history entr" +
+                                        (data.removed === 1 ? "y" : "ies") + ".");
+                        })
+                        .catch(function () { showToast("error", "Could not reach the server."); });
+        });
+
         sendBtn.addEventListener("click", function () {
                 var campaign = state.campaigns.filter(function (c) { return c.id === state.campaignId; })[0];
-                confirmText.textContent =
-                        "Send " + (campaign ? '"' + campaign.title + '"' : "the text message") +
-                        " to " + state.selectedIds.size + " lead(s) on WhatsApp?";
+                confirmText.textContent = campaign
+                        ? 'Send the image "' + campaign.title + '" to ' +
+                                state.selectedIds.size + " contact(s) on WhatsApp?"
+                        : "Send a TEXT-ONLY message (no image) to " +
+                                state.selectedIds.size + " contact(s) on WhatsApp?";
                 confirmModal.classList.remove("is-hidden");
         });
 
@@ -3574,7 +3679,7 @@ BULK_QUOTE_SCRIPT = r"""
 
         confirmBtn.addEventListener("click", function () {
                 confirmModal.classList.add("is-hidden");
-                state.queue = state.leads.filter(function (lead) {
+                state.queue = state.recipients.filter(function (lead) {
                         return lead.valid && state.selectedIds.has(lead.id);
                 });
                 state.queueIndex = 0;
@@ -3644,20 +3749,21 @@ BULK_QUOTE_SCRIPT = r"""
                         });
         }
 
-        fetch("/api/bulk-quote/leads")
+        fetch("/api/bulk-quote/recipients")
                 .then(function (response) { return response.json(); })
                 .then(function (data) {
-                        state.leads = data.leads || [];
+                        state.recipients = data.recipients || [];
                         renderLeads();
                 })
                 .catch(function () {
-                        leadsBody.innerHTML = '<tr><td colspan="7">Could not load leads.</td></tr>';
+                        leadsBody.innerHTML = '<tr><td colspan="8">Could not load contacts.</td></tr>';
                 });
 
         fetch("/api/bulk-quote/campaigns")
                 .then(function (response) { return response.json(); })
                 .then(function (data) {
                         state.campaigns = data.campaigns || [];
+                        state.campaignId = pickDefaultCampaign(state.campaigns);
                         renderCampaigns();
                 })
                 .catch(function () { renderCampaigns(); });
@@ -3851,10 +3957,15 @@ class AppHandler(BaseHTTPRequestHandler):
 
                 if self.path == "/api/bulk-quote/send":
                         data = self.read_json_body()
-                        payload, status_code = send_bulk_quote_to_lead(
+                        payload, status_code = send_bulk_quote_to_recipient(
                                 str(data.get("id", "")), str(data.get("campaignId", "") or "")
                         )
                         self.send_json_response(status_code, payload)
+                        return
+
+                if self.path == "/api/bulk-quote/clear-history":
+                        removed = clear_bulk_sent_history()
+                        self.send_json_response(200, {"success": True, "removed": removed})
                         return
 
                 if self.path == "/api/bulk-quote/delete-campaign":
@@ -4038,8 +4149,8 @@ class AppHandler(BaseHTTPRequestHandler):
                         self.send_json_response(status_code, payload)
                         return
 
-                if parsed.path == "/api/bulk-quote/leads":
-                        self.send_json_response(200, {"leads": load_bulk_leads()})
+                if parsed.path == "/api/bulk-quote/recipients":
+                        self.send_json_response(200, {"recipients": load_bulk_recipients()})
                         return
 
                 if parsed.path == "/api/bulk-quote/campaigns":

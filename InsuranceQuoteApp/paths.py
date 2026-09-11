@@ -22,6 +22,37 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 
 
+def load_env_file():
+        """Read KEY=value lines from GI_ENV_FILE into the environment.
+
+        The WhatsApp token and phone number id are set in cPanel for the hosted
+        app, which leaves nothing for a local run or a cron job to read - hence
+        this file, the same one send_reminders.py has always taken its
+        credentials from. Real environment variables win over the file, so an
+        export on the command line still overrides it.
+        """
+        env_path = os.environ.get("GI_ENV_FILE", "").strip()
+        if not env_path:
+                return
+        try:
+                text = Path(env_path).expanduser().read_text(encoding="utf-8")
+        except OSError:
+                # A missing or unreadable env file must not stop the app booting;
+                # the features that need those values report their own absence.
+                return
+
+        for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                        continue
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+# Before anything below reads os.environ.
+load_env_file()
+
+
 def resolve_data_dir():
         """The directory live data is read from and written to."""
         configured = os.environ.get("GI_DATA_DIR", "").strip()

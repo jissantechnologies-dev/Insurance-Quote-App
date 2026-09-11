@@ -41,6 +41,13 @@ InsuranceQuoteApp/messages.db-shm
 # copies are the real ones.
 InsuranceQuoteApp/chat_media/
 
+# Bulk quote campaign images and their index, plus the bulk send history -
+# live data written by the running server, same reasoning as sent_quote.json
+# above. The images are an agent's uploads, not part of the app.
+InsuranceQuoteApp/campaigns/
+InsuranceQuoteApp/campaigns.json
+InsuranceQuoteApp/sent_bulk_quote.json
+
 # Reminder send log - which policies have already been messaged.
 InsuranceQuoteApp/reminders.db
 InsuranceQuoteApp/reminders.log

@@ -16,6 +16,7 @@ from urllib.parse import quote_plus
 from flask import Flask, Response, abort, jsonify, redirect, request, send_file
 
 import auth
+import campaigns
 import chat
 import legal
 import main as core
@@ -150,6 +151,7 @@ def query_params():
 @app.get("/expiry-alerts")
 @app.get("/send-quote")
 @app.get("/send-payment-link")
+@app.get("/bulk-quote")
 def render_page_route():
         return Response(
                 core.render_page(request.path, query_params(), current_user()),
@@ -250,6 +252,77 @@ def send_link_send():
         data = request.get_json(silent=True) or {}
         payload, status_code = core.send_quote_for_row(data.get("id"), kind)
         return jsonify(payload), status_code
+
+
+# --- Bulk quote ------------------------------------------------------------
+# main.py serves these from its own handler; Flask needs them spelled out
+# separately or the page renders and every button on it 404s.
+
+
+@app.get("/api/bulk-quote/recipients")
+def bulk_quote_recipients():
+	return jsonify({"recipients": core.load_bulk_recipients()})
+
+
+@app.get("/api/bulk-quote/campaigns")
+def bulk_quote_campaigns():
+	return jsonify({
+		"campaigns": [
+			core.build_campaign_payload(campaign)
+			for campaign in campaigns.load_campaigns()
+		],
+	})
+
+
+@app.get("/api/bulk-quote/sent-rows")
+def bulk_quote_sent_rows():
+	return jsonify({"rows": core.load_bulk_sent_history()})
+
+
+@app.post("/api/bulk-quote/upload")
+def bulk_quote_upload():
+	upload = request.files.get("campaign_file")
+	if upload is None:
+		return jsonify({"success": False, "error": "No image was uploaded."}), 400
+	payload, status_code = core.import_bulk_campaign_image(
+		upload.filename or "", upload.read(), request.form.get("title", "")
+	)
+	return jsonify(payload), status_code
+
+
+@app.post("/api/bulk-quote/send")
+def bulk_quote_send():
+	data = request.get_json(silent=True) or {}
+	payload, status_code = core.send_bulk_quote_to_recipient(
+		str(data.get("id", "")), str(data.get("campaignId", "") or "")
+	)
+	return jsonify(payload), status_code
+
+
+@app.post("/api/bulk-quote/clear-history")
+def bulk_quote_clear_history():
+	removed = core.clear_bulk_sent_history()
+	return jsonify({"success": True, "removed": removed})
+
+
+@app.post("/api/bulk-quote/delete-campaign")
+def bulk_quote_delete_campaign():
+	data = request.get_json(silent=True) or {}
+	campaign_id = str(data.get("id", ""))
+	if not campaigns.is_campaign_id(campaign_id):
+		return jsonify({"success": False, "error": "Invalid campaign."}), 400
+	removed = campaigns.delete_campaign(campaign_id)
+	return jsonify(
+		{"success": removed, "error": "" if removed else "Campaign not found."}
+	), (200 if removed else 404)
+
+
+@app.get("/campaign-image/<campaign_id>")
+def campaign_image(campaign_id):
+	image_path = core.get_campaign_image_path(campaign_id)
+	if image_path is None:
+		abort(404)
+	return send_file(image_path, as_attachment=False, download_name=image_path.name)
 
 
 # --- WhatsApp Cloud API webhook -------------------------------------------

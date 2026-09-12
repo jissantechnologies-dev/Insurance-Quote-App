@@ -33,8 +33,14 @@ set -euo pipefail
 REPO_DIR="${GI_REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 SOURCE_DIR="$REPO_DIR/InsuranceQuoteApp"
 PROD_DOMAIN="${GI_PROD_DOMAIN:-app.gravityinsurance.in}"
-DEV_DOMAIN="${GI_DEV_DOMAIN:-dev.app.gravityinsurance.in}"
+# A single-label subdomain: cPanel's "Create a New Domain" rejects a
+# four-label host ("You must specify a subdomain"), and a wildcard certificate
+# only covers one level, so dev.app.* would also have had no SSL.
+DEV_DOMAIN="${GI_DEV_DOMAIN:-devapp.gravityinsurance.in}"
 PROD_APP_ROOT="${GI_PROD_APP_ROOT:-$HOME/public_html/$PROD_DOMAIN}"
+# Dev sits outside public_html so the parent SPA .htaccess rewrite cannot
+# leak into it and turn every request into a 500.
+DEV_APP_ROOT="${GI_DEV_APP_ROOT:-$HOME/$DEV_DOMAIN}"
 DATA_ROOT="${GI_DATA_ROOT:-$HOME/gi-data}"
 PROD_DATA="$DATA_ROOT/production"
 DEV_DATA="$DATA_ROOT/dev"
@@ -137,11 +143,12 @@ cat <<INSTRUCTIONS
 
     1. Domains -> Create a Domain
          domain:        $DEV_DOMAIN
-         document root: public_html/$DEV_DOMAIN
+         document root: $DEV_APP_ROOT
+                        (share document root: leave UNCHECKED)
 
     2. Setup Python App -> Create Application
          python:        3.11
-         app root:      public_html/$DEV_DOMAIN
+         app root:      $DEV_APP_ROOT
          app URL:       $DEV_DOMAIN
          startup file:  app.py
          entry point:   application

@@ -4,9 +4,9 @@ Two independent instances of the same app on one cPanel account:
 
 | | production | dev |
 |---|---|---|
-| URL | `app.gravityinsurance.in` | `dev.app.gravityinsurance.in` |
-| app root | `~/public_html/app.gravityinsurance.in` | `~/public_html/dev.app.gravityinsurance.in` |
-| virtualenv | `~/virtualenv/public_html/app.gravityinsurance.in/3.11` | `~/virtualenv/public_html/dev.app.gravityinsurance.in/3.11` |
+| URL | `app.gravityinsurance.in` | `devapp.gravityinsurance.in` |
+| app root | `~/public_html/app.gravityinsurance.in` | `~/devapp.gravityinsurance.in` |
+| virtualenv | `~/virtualenv/public_html/app.gravityinsurance.in/3.11` | `~/virtualenv/devapp.gravityinsurance.in/3.11` |
 | data dir | `~/gi-data/production` | `~/gi-data/dev` |
 | default branch | `main` | `quote-automation` |
 | data | starts empty | seeded with the customer list |
@@ -14,6 +14,20 @@ Two independent instances of the same app on one cPanel account:
 | page banner | none | orange "DEV ENVIRONMENT" bar |
 
 They share the code and the WhatsApp credentials. They share nothing else.
+
+### Why `devapp` and not `dev.app`
+
+`dev.app.gravityinsurance.in` was the obvious name and does not work here.
+cPanel's **Create a New Domain** rejects a four-label host with "You must
+specify a subdomain", and a wildcard certificate for `*.gravityinsurance.in`
+only covers one level, so even once created it would have had no SSL. A
+single-label subdomain avoids both.
+
+Dev's app root also sits **outside** `public_html`. Anything under
+`public_html` inherits the React site's `.htaccess` rewrite, which answers
+every request with a 500 unless an override is written into the subdomain's
+own `.htaccess`. Production still lives inside `public_html` and still needs
+that override; dev sidesteps it entirely.
 
 ## How the split works
 
@@ -84,23 +98,33 @@ real archived data instead, unpack the tarball into `~/gi-data/dev`.
 
 ### 3. Create the dev subdomain in cPanel
 
-1. **Domains → Create a Domain**: `dev.app.gravityinsurance.in`, document root
-   `public_html/dev.app.gravityinsurance.in`.
+0. **DNS**: an `A` record `devapp` → the server IP. The name field is
+   relative — entering the full host doubles the domain.
+1. **Domains → Create a New Domain**: `devapp.gravityinsurance.in`, document
+   root `devapp.gravityinsurance.in`, **share document root unchecked** (that
+   setting is permanent). Removing the `public_html/` prefix is the point —
+   see above.
 2. **Setup Python App**: Python 3.11, application root
-   `public_html/dev.app.gravityinsurance.in`, application URL the new
-   subdomain, startup file `app.py`, entry point `application`.
+   `devapp.gravityinsurance.in`, application URL the new subdomain, startup
+   file `app.py`, entry point `application`. Passenger log
+   `logs/devapp-passenger.log`.
 3. In that app's **Environment variables**, add:
    - `GI_DATA_DIR` = `/home/USER/gi-data/dev`
    - `GI_ENV_NAME` = `dev`
+   - `GI_PEER_DATA_DIR` = `/home/USER/gi-data/production`
    - the same `GI_WA_*` and `GI_QUOTE_CONTACT` values as production.
 4. Add the same variables to the **production** app, with
    `GI_DATA_DIR=/home/USER/gi-data/production` and `GI_ENV_NAME=production`.
 5. Restart both apps.
 
+`GI_WA_VERIFY_TOKEN` on dev is inert: Meta points the webhook at one URL, so
+inbound messages keep arriving on production only. Repointing the webhook at
+dev would stop production receiving replies.
+
 The `.htaccess` rewrite override (`RewriteEngine On` / `RewriteRule ^ - [L]`)
-is needed on the dev subdomain too — it sits inside `public_html` and inherits
-the React site's rewrite exactly as production does. `deploy.sh` checks for it
-and inserts it if missing.
+is what production needs to survive the React site's rewrite; `deploy.sh`
+checks for it and inserts it if missing. Dev, being outside `public_html`,
+inherits nothing and does not need it.
 
 ### 4. Deploy
 

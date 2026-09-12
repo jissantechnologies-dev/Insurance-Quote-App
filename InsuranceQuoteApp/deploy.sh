@@ -56,11 +56,15 @@ case "$ENV_NAME" in
         prod|production)
                 ENV_NAME="production"
                 DOMAIN="app.gravityinsurance.in"
+                DEFAULT_APP_ROOT="$HOME/public_html/$DOMAIN"
                 DEFAULT_BRANCH="main"
                 ;;
         dev|development)
                 ENV_NAME="dev"
-                DOMAIN="dev.app.gravityinsurance.in"
+                DOMAIN="devapp.gravityinsurance.in"
+                # Outside public_html: the parent SPA .htaccess rewrite leaks
+                # into anything under it and answers every request with a 500.
+                DEFAULT_APP_ROOT="$HOME/$DOMAIN"
                 DEFAULT_BRANCH="quote-automation"
                 ;;
         *)
@@ -69,8 +73,10 @@ case "$ENV_NAME" in
                 ;;
 esac
 
-APP_ROOT="${GI_APP_ROOT:-$HOME/public_html/$DOMAIN}"
-VENV="${GI_VENV:-$HOME/virtualenv/public_html/$DOMAIN/3.11}"
+APP_ROOT="${GI_APP_ROOT:-$DEFAULT_APP_ROOT}"
+# cPanel mirrors the app root's path under ~/virtualenv, so the venv location
+# follows whatever APP_ROOT is rather than being spelled out twice.
+VENV="${GI_VENV:-$HOME/virtualenv/${APP_ROOT#$HOME/}/3.11}"
 DATA_DIR="${GI_DATA_DIR:-$HOME/gi-data/$ENV_NAME}"
 BRANCH="${GI_DEPLOY_BRANCH:-$DEFAULT_BRANCH}"
 

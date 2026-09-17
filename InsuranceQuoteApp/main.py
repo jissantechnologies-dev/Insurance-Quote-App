@@ -6,7 +6,7 @@ import re
 import uuid
 from io import BytesIO
 from collections import Counter
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from email.parser import BytesParser
 from email.policy import default
@@ -2952,14 +2952,18 @@ def load_bulk_sent_history():
         return load_json_list(BULK_SENT_PATH)
 
 
+def save_bulk_sent_history(history):
+        paths.ensure_data_dir()
+        with BULK_SENT_PATH.open("w", encoding="utf-8") as file:
+                json.dump(history, file, indent=4)
+
+
 def record_bulk_send(entry):
         """Append one attempt to the bulk history, newest first."""
-        paths.ensure_data_dir()
         history = load_bulk_sent_history()
         history.insert(0, entry)
         del history[500:]
-        with BULK_SENT_PATH.open("w", encoding="utf-8") as file:
-                json.dump(history, file, indent=4)
+        save_bulk_sent_history(history)
         return entry
 
 
@@ -2990,9 +2994,22 @@ def bulk_sent_rows():
                         # Never accepted by Meta: there is nothing to follow up.
                         row["delivery"] = "Failed"
                         row["deliveryError"] = row.get("error", "")
+                elif status == "failed" and bulk_retry_pending(row, error):
+                        row["delivery"] = "Retrying"
+                        row["deliveryError"] = (
+                                f"WhatsApp held this back ({error}). It will be resent "
+                                f"automatically after {bulk_retry_due_at(row).strftime('%Y-%m-%d %I:%M %p')} "
+                                f"(attempt {int(row.get('retries') or 0) + 2} of {BULK_RETRY_MAX + 1})."
+                        )
                 elif status:
                         row["delivery"] = BULK_DELIVERY_LABELS.get(status, status.title())
                         row["deliveryError"] = error
+                        retries = int(row.get("retries") or 0)
+                        if status == "failed" and retries:
+                                row["deliveryError"] = (
+                                        f"{error} (still failing after {retries} automatic "
+                                        f"resend{'s' if retries != 1 else ''})"
+                                )
                 else:
                         # Accepted, but no webhook has been seen for it yet - either
                         # it is still in flight or Meta dropped it silently.
@@ -3166,6 +3183,159 @@ def send_bulk_campaign_image(person, campaign):
         return False, "The campaign image could not be sent.", ""
 
 
+def deliver_bulk_message(person, campaign):
+        """Send one person the campaign image, or the text template when there
+        is no campaign. Returns (ok, error, wamid)."""
+        if campaign is not None:
+                return send_bulk_campaign_image(person, campaign)
+
+        ok, error, wamid = send_template_message(
+                person["mobileNumber"], WA_TEMPLATE_BULK_TEXT, []
+        )
+        if ok:
+                # The image branch already files its send; the text one has
+                # to as well, or the status webhook has no row to update.
+                chat.save_message(
+                        wamid, person["mobileNumber"], "out",
+                        f"Bulk offer message sent to {person['name']}",
+                        status="sent",
+                )
+        return ok, error, wamid
+
+
+# Meta drops some marketing messages it has already accepted so that no one
+# person gets too many (error 131049, "...to maintain healthy ecosystem
+# engagement"). The cap eases with time, so those - and only those - are sent
+# again by retry_bulk.py once a day has passed. Any other failure (a bad
+# number, a blocked account) would just fail the same way again.
+BULK_RETRY_MAX = 2
+BULK_RETRY_AFTER = timedelta(hours=24)
+
+
+def is_retryable_bulk_error(error):
+        text = str(error or "").lower()
+        return "131049" in text or "healthy ecosystem" in text
+
+
+def bulk_last_attempt(row):
+        stamp = str(row.get("lastAttemptAt") or "")
+        try:
+                return datetime.fromisoformat(stamp)
+        except ValueError:
+                pass
+        # Rows written before lastAttemptAt existed only carry the display time.
+        try:
+                return datetime.strptime(
+                        str(row.get("sentAt") or ""), "%Y-%m-%d %I:%M %p"
+                ).replace(tzinfo=IST)
+        except ValueError:
+                return None
+
+
+def bulk_retry_due_at(row):
+        return bulk_last_attempt(row) + BULK_RETRY_AFTER
+
+
+def bulk_retry_pending(row, error):
+        return (
+                is_retryable_bulk_error(error)
+                and int(row.get("retries") or 0) < BULK_RETRY_MAX
+                and bulk_last_attempt(row) is not None
+        )
+
+
+def find_bulk_retry_campaign(row):
+        """The campaign a history row sent, as (found, campaign).
+
+        campaign is None for a text-only send. Rows from before campaignId was
+        stored are matched on the title."""
+        campaign_id = str(row.get("campaignId") or "")
+        if campaign_id:
+                campaign = campaigns.get_campaign(campaign_id)
+                return campaign is not None, campaign
+        title = row.get("campaign", "")
+        if not title or title == "Text only":
+                return True, None
+        campaign = next(
+                (c for c in campaigns.load_campaigns() if c.get("title") == title), None
+        )
+        return campaign is not None, campaign
+
+
+def retry_bulk_failures(now=None, dry_run=False):
+        """Resend bulk messages Meta held back for frequency capping.
+
+        Run hourly by retry_bulk.py. A resend replaces the row's wamid, so the
+        history then follows the new message: the row is updated in place
+        rather than duplicated. Returns a summary dict."""
+        now = now or datetime.now(IST)
+        history = load_bulk_sent_history()
+        statuses = chat.get_statuses([row.get("wamid", "") for row in history])
+        summary = {"retried": 0, "failed": 0, "gaveUp": 0, "details": []}
+        updates = {}
+
+        for row in history:
+                wamid = row.get("wamid", "")
+                if row.get("status") != "Sent" or not wamid:
+                        continue
+                status, error = statuses.get(wamid, ("", ""))
+                if status != "failed" or not bulk_retry_pending(row, error):
+                        continue
+                if now < bulk_retry_due_at(row):
+                        continue
+
+                label = f"{row.get('name', '')} ({row.get('mobileNumber', '')})"
+                change = {
+                        "retries": int(row.get("retries") or 0) + 1,
+                        "lastAttemptAt": now.isoformat(timespec="seconds"),
+                }
+                recipient_id = row.get("recipientId") or normalize_send_quote_mobile(
+                        row.get("mobileNumber", "")
+                )
+                person = find_bulk_recipient(recipient_id)
+                found, campaign = find_bulk_retry_campaign(row)
+                if person is None or not person["valid"] or not found:
+                        # Removed from the lists, or the image was deleted: stop.
+                        change["retries"] = BULK_RETRY_MAX
+                        summary["gaveUp"] += 1
+                        summary["details"].append(
+                                f"gave up on {label}: recipient or campaign no longer exists"
+                        )
+                        if not dry_run:
+                                updates[wamid] = change
+                        continue
+
+                if dry_run:
+                        summary["retried"] += 1
+                        summary["details"].append(f"would resend to {label}")
+                        continue
+
+                ok, send_error, new_wamid = deliver_bulk_message(person, campaign)
+                if ok:
+                        change["wamid"] = new_wamid
+                        summary["retried"] += 1
+                        summary["details"].append(
+                                f"resent to {label} (attempt {change['retries'] + 1})"
+                        )
+                else:
+                        # Refused outright this time. The old wamid stays, so the
+                        # row keeps showing why, and a later run tries again if
+                        # attempts remain.
+                        summary["failed"] += 1
+                        summary["details"].append(f"resend to {label} failed: {send_error}")
+                updates[wamid] = change
+
+        if updates:
+                # Re-read so sends made while this ran are not overwritten.
+                history = load_bulk_sent_history()
+                for row in history:
+                        change = updates.get(row.get("wamid", ""))
+                        if change:
+                                row.update(change)
+                save_bulk_sent_history(history)
+        return summary
+
+
 def send_bulk_quote_to_recipient(recipient_id, campaign_id=""):
         """Send one person their copy of the campaign. Returns (payload, status).
 
@@ -3188,6 +3358,11 @@ def send_bulk_quote_to_recipient(recipient_id, campaign_id=""):
                 "mobileNumber": person["rawMobile"],
                 "vehicle": " ".join(part for part in (person["carBrand"], person["carModel"]) if part),
                 "campaign": campaign["title"] if campaign else "Text only",
+                # Kept so an automatic resend can send the same thing again.
+                "campaignId": campaign["id"] if campaign else "",
+                "recipientId": person["id"],
+                "retries": 0,
+                "lastAttemptAt": datetime.now(IST).isoformat(timespec="seconds"),
                 "status": "Failed",
                 "error": "",
                 # Meta's id for the message, so the delivery state that arrives
@@ -3215,21 +3390,7 @@ def send_bulk_quote_to_recipient(recipient_id, campaign_id=""):
                         ),
                 }, 200
 
-        if campaign is None:
-                ok, error, wamid = send_template_message(
-                        person["mobileNumber"], WA_TEMPLATE_BULK_TEXT, []
-                )
-                if ok:
-                        # The image branch already files its send; the text one has
-                        # to as well, or the status webhook has no row to update.
-                        chat.save_message(
-                                wamid, person["mobileNumber"], "out",
-                                f"Bulk offer message sent to {person['name']}",
-                                status="sent",
-                        )
-        else:
-                ok, error, wamid = send_bulk_campaign_image(person, campaign)
-
+        ok, error, wamid = deliver_bulk_message(person, campaign)
         if not ok:
                 entry["error"] = error
                 record_bulk_send(entry)
@@ -3568,7 +3729,8 @@ BULK_QUOTE_SCRIPT = r"""
                 Sent: "Handed to WhatsApp; not confirmed on the handset yet.",
                 Delivered: "Reached the recipient's phone.",
                 Read: "Opened by the recipient.",
-                Failed: "WhatsApp could not deliver this message."
+                Failed: "WhatsApp could not deliver this message.",
+                Retrying: "WhatsApp held this back; it will be resent automatically."
         };
 
         function renderSent(rows) {

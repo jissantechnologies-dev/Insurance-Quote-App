@@ -114,6 +114,7 @@ EXCLUDES=(
         --exclude "messages.db-shm"
         --exclude "reminders.db"
         --exclude "reminders.log"
+        --exclude "retry_bulk.log"
         --exclude "sent_quote.json"
         --exclude "sent_payment.json"
         --exclude "batch_quote.json"

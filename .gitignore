@@ -51,6 +51,7 @@ InsuranceQuoteApp/sent_bulk_quote.json
 # Reminder send log - which policies have already been messaged.
 InsuranceQuoteApp/reminders.db
 InsuranceQuoteApp/reminders.log
+InsuranceQuoteApp/retry_bulk.log
 
 # The active client list, the imported-leads scratch file and any customer
 # workbook - live data written by the running server, and the reason

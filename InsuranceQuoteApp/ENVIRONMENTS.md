@@ -206,6 +206,22 @@ Cron does not load the cPanel app's environment variables, so `GI_DATA_DIR`
 has to be set here too — without it the run reads the app directory and finds
 no customers.
 
+## The bulk resend cron
+
+WhatsApp sometimes accepts a bulk marketing message and then drops it (error
+131049, "healthy ecosystem engagement"). `retry_bulk.py` resends those once
+24 hours have passed, at most twice each; the history shows them as
+"Retrying" meanwhile. Run it hourly:
+
+```
+0 * * * * GI_ENV_FILE=/home/USER/gi.env GI_DATA_DIR=/home/USER/gi-data/production \
+    /home/USER/virtualenv/public_html/app.gravityinsurance.in/3.11/bin/python \
+    /home/USER/public_html/app.gravityinsurance.in/retry_bulk.py \
+    >> /home/USER/gi-data/production/retry_bulk.log 2>&1
+```
+
+It prints only when it did something. Check with `--dry-run` first.
+
 ## Restoring an archive
 
 ```bash

@@ -800,6 +800,10 @@ pre {
     background: linear-gradient(135deg, #ef4444, #b91c1c);
 }
 
+.status-retrying {
+    background: linear-gradient(135deg, #fb923c, #c2410c);
+}
+
 .pagination-bar {
     display: flex;
     align-items: center;

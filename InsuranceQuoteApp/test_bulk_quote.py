@@ -391,6 +391,136 @@ class BulkQuoteTests(unittest.TestCase):
                 self.main.record_bulk_send({"name": "Old", "status": "Sent"})
                 self.assertEqual(self.main.bulk_sent_rows()[0]["delivery"], "Pending")
 
+        # --- automatic resend of frequency-capped messages -------------------
+
+        CAPPED = "This message was not delivered to maintain healthy ecosystem engagement."
+
+        def capped_row(self, wamid="wamid-1", hours_ago=25, retries=0, **extra):
+                """A text-only send to Mani that Meta accepted and then dropped."""
+                sent = self.main.datetime.now(self.main.IST) - self.main.timedelta(hours=hours_ago)
+                row = {
+                        "name": "Mani", "list": "Active Client", "mobileNumber": "9884000111",
+                        "campaign": "Text only", "campaignId": "", "recipientId": "919884000111",
+                        "status": "Sent", "wamid": wamid, "retries": retries,
+                        "lastAttemptAt": sent.isoformat(timespec="seconds"),
+                        "sentAt": sent.strftime("%Y-%m-%d %I:%M %p"),
+                }
+                row.update(extra)
+                self.main.record_bulk_send(row)
+                self.main.chat.save_message(wamid, "919884000111", "out", "hi", status="sent")
+                self.main.chat.update_status(wamid, "failed", self.CAPPED)
+
+        def fake_text_sends(self, *results):
+                calls = []
+                results = list(results)
+
+                def fake(number, template, values):
+                        calls.append(number)
+                        return results.pop(0)
+
+                self.main.WA_TOKEN = "test-token"
+                self.main.WA_PHONE_NUMBER_ID = "12345"
+                self.main.send_template_message = fake
+                return calls
+
+        def test_a_capped_message_shows_as_retrying(self):
+                self.capped_row(hours_ago=1)
+                row = self.main.bulk_sent_rows()[0]
+                self.assertEqual(row["delivery"], "Retrying")
+                self.assertIn("resent automatically", row["deliveryError"])
+
+        def test_other_delivery_failures_are_not_retried(self):
+                self.capped_row()
+                self.main.chat.update_status("wamid-1", "failed", "Message undeliverable")
+                calls = self.fake_text_sends()
+                self.assertEqual(self.main.retry_bulk_failures()["retried"], 0)
+                self.assertEqual(calls, [])
+                self.assertEqual(self.main.bulk_sent_rows()[0]["delivery"], "Failed")
+
+        def test_capped_message_is_not_resent_before_a_day_has_passed(self):
+                self.capped_row(hours_ago=5)
+                calls = self.fake_text_sends()
+                self.assertEqual(self.main.retry_bulk_failures()["retried"], 0)
+                self.assertEqual(calls, [])
+
+        def test_capped_message_is_resent_in_place_after_a_day(self):
+                self.capped_row()
+                calls = self.fake_text_sends((True, "", "wamid-2"))
+
+                summary = self.main.retry_bulk_failures()
+                self.assertEqual(summary["retried"], 1, summary)
+                self.assertEqual(calls, ["919884000111"])
+
+                history = self.main.load_bulk_sent_history()
+                self.assertEqual(len(history), 1)
+                self.assertEqual(history[0]["wamid"], "wamid-2")
+                self.assertEqual(history[0]["retries"], 1)
+                # The new message has no webhook yet.
+                self.assertEqual(self.main.bulk_sent_rows()[0]["delivery"], "Sent")
+
+                # Running again straight away does nothing.
+                self.assertEqual(self.main.retry_bulk_failures()["retried"], 0)
+
+        def test_resending_stops_after_the_limit(self):
+                self.capped_row(retries=self.main.BULK_RETRY_MAX)
+                calls = self.fake_text_sends()
+                self.assertEqual(self.main.retry_bulk_failures()["retried"], 0)
+                self.assertEqual(calls, [])
+                row = self.main.bulk_sent_rows()[0]
+                self.assertEqual(row["delivery"], "Failed")
+                self.assertIn("still failing after 2 automatic resends", row["deliveryError"])
+
+        def test_dry_run_sends_nothing_and_changes_nothing(self):
+                self.capped_row()
+                calls = self.fake_text_sends()
+                summary = self.main.retry_bulk_failures(dry_run=True)
+                self.assertEqual(summary["retried"], 1)
+                self.assertEqual(calls, [])
+                self.assertEqual(self.main.load_bulk_sent_history()[0]["retries"], 0)
+
+        def test_campaign_image_is_resent_with_the_same_image(self):
+                campaign, _ = self.campaigns.save_campaign_image("offer.png", b"png", "Offer")
+                self.capped_row(campaign="Offer", campaignId=campaign["id"])
+                self.main.WA_TOKEN = "test-token"
+                self.main.WA_PHONE_NUMBER_ID = "12345"
+                self.main.whatsapp_media.upload_media = lambda *a, **k: (True, "media-1", "")
+                sent = []
+                self.main.whatsapp_media.send_image_template = (
+                        lambda number, template, media_id, *a, **k: sent.append(media_id) or (True, "wamid-2", "")
+                )
+                self.assertEqual(self.main.retry_bulk_failures()["retried"], 1)
+                self.assertEqual(sent, ["media-1"])
+
+        def test_retry_gives_up_when_the_campaign_was_deleted(self):
+                self.capped_row(campaign="Gone", campaignId="missing")
+                calls = self.fake_text_sends()
+                summary = self.main.retry_bulk_failures()
+                self.assertEqual(summary["gaveUp"], 1)
+                self.assertEqual(calls, [])
+                self.assertEqual(self.main.bulk_sent_rows()[0]["delivery"], "Failed")
+
+        def test_rows_from_before_retry_fields_are_still_retried(self):
+                """Karthick's row was written before campaignId and lastAttemptAt."""
+                self.capped_row(hours_ago=30)
+                history = self.main.load_bulk_sent_history()
+                for key in ("campaignId", "recipientId", "retries", "lastAttemptAt"):
+                        del history[0][key]
+                self.main.save_bulk_sent_history(history)
+
+                calls = self.fake_text_sends((True, "", "wamid-2"))
+                self.assertEqual(self.main.retry_bulk_failures()["retried"], 1)
+                self.assertEqual(calls, ["919884000111"])
+
+        def test_new_sends_store_what_a_resend_needs(self):
+                self.fake_text_sends((True, "", "wamid-text"))
+                person = next(p for p in self.main.load_bulk_recipients() if p["valid"])
+                self.main.send_bulk_quote_to_recipient(person["id"])
+                row = self.main.load_bulk_sent_history()[0]
+                self.assertEqual(row["recipientId"], person["id"])
+                self.assertEqual(row["campaignId"], "")
+                self.assertEqual(row["retries"], 0)
+                self.assertTrue(row["lastAttemptAt"])
+
         def test_page_renders_filter_options_from_the_leads(self):
                 html = self.main.build_bulk_quote_content()
                 self.assertIn("Send Bulk Quote", html)

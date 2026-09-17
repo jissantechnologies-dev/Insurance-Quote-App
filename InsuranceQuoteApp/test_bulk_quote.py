@@ -26,6 +26,10 @@ def load_app(data_dir):
         importlib.reload(paths)
         import campaigns
         importlib.reload(campaigns)
+        import chat
+        # chat caches its database path at import time, so it has to be reloaded
+        # alongside paths or the tests would write to the real messages.db.
+        importlib.reload(chat)
         import main
         importlib.reload(main)
         return main, campaigns
@@ -314,6 +318,78 @@ class BulkQuoteTests(unittest.TestCase):
                 history = json.loads(self.main.BULK_SENT_PATH.read_text(encoding="utf-8"))
                 self.assertEqual(len(history), 500)
                 self.assertEqual(history[0]["name"], "n504")
+
+        def test_successful_send_records_the_wamid(self):
+                """Without Meta's id, no later delivery update can find the row."""
+                self.main.WA_TOKEN = "test-token"
+                self.main.WA_PHONE_NUMBER_ID = "12345"
+                campaign, _ = self.campaigns.save_campaign_image("offer.png", b"png", "Offer")
+                self.main.whatsapp_media.upload_media = (
+                        lambda *a, **k: (True, "media-1", "")
+                )
+                self.main.whatsapp_media.send_image_template = (
+                        lambda *a, **k: (True, "wamid-abc", "")
+                )
+
+                person = next(p for p in self.main.load_bulk_recipients() if p["valid"])
+                payload, _ = self.main.send_bulk_quote_to_recipient(person["id"], campaign["id"])
+                self.assertTrue(payload["success"], payload)
+                self.assertEqual(self.main.load_bulk_sent_history()[0]["wamid"], "wamid-abc")
+
+        def test_text_only_send_is_filed_so_the_webhook_can_update_it(self):
+                """The text branch used to throw its wamid away."""
+                self.main.WA_TOKEN = "test-token"
+                self.main.WA_PHONE_NUMBER_ID = "12345"
+                self.main.send_template_message = (
+                        lambda *a, **k: (True, "", "wamid-text")
+                )
+
+                person = next(p for p in self.main.load_bulk_recipients() if p["valid"])
+                payload, _ = self.main.send_bulk_quote_to_recipient(person["id"])
+                self.assertTrue(payload["success"], payload)
+                self.assertEqual(self.main.load_bulk_sent_history()[0]["wamid"], "wamid-text")
+
+                thread = self.main.chat.get_thread(person["mobileNumber"])
+                self.assertEqual([m["id"] for m in thread], ["wamid-text"])
+
+        def test_accepted_message_with_no_webhook_yet_reads_as_pending(self):
+                self.main.record_bulk_send({"name": "Mani", "status": "Sent", "wamid": "wamid-1"})
+                row = self.main.bulk_sent_rows()[0]
+                self.assertEqual(row["delivery"], "Pending")
+
+        def test_delivery_state_follows_the_status_webhook(self):
+                self.main.record_bulk_send({"name": "Mani", "status": "Sent", "wamid": "wamid-1"})
+                self.main.chat.save_message("wamid-1", "919884000111", "out", "hi", status="sent")
+
+                self.assertEqual(self.main.bulk_sent_rows()[0]["delivery"], "Sent")
+
+                self.main.chat.update_status("wamid-1", "delivered")
+                self.assertEqual(self.main.bulk_sent_rows()[0]["delivery"], "Delivered")
+
+                self.main.chat.update_status("wamid-1", "read")
+                self.assertEqual(self.main.bulk_sent_rows()[0]["delivery"], "Read")
+
+        def test_a_message_meta_later_rejects_shows_as_failed_with_its_reason(self):
+                """The symptom that started this: accepted, then never delivered."""
+                self.main.record_bulk_send({"name": "Mani", "status": "Sent", "wamid": "wamid-1"})
+                self.main.chat.save_message("wamid-1", "919884000111", "out", "hi", status="sent")
+                self.main.chat.update_status("wamid-1", "failed", "Message undeliverable")
+
+                row = self.main.bulk_sent_rows()[0]
+                self.assertEqual(row["delivery"], "Failed")
+                self.assertEqual(row["deliveryError"], "Message undeliverable")
+
+        def test_a_send_that_never_left_carries_its_send_time_error(self):
+                self.main.record_bulk_send(
+                        {"name": "NoNumber", "status": "Failed", "error": "No usable name or mobile number.", "wamid": ""}
+                )
+                row = self.main.bulk_sent_rows()[0]
+                self.assertEqual(row["delivery"], "Failed")
+                self.assertEqual(row["deliveryError"], "No usable name or mobile number.")
+
+        def test_history_rows_predating_the_wamid_field_still_render(self):
+                self.main.record_bulk_send({"name": "Old", "status": "Sent"})
+                self.assertEqual(self.main.bulk_sent_rows()[0]["delivery"], "Pending")
 
         def test_page_renders_filter_options_from_the_leads(self):
                 html = self.main.build_bulk_quote_content()

@@ -1383,3 +1383,10 @@ pre {
 .card-heading-row h2 {
     margin: 0;
 }
+
+.card-heading-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}

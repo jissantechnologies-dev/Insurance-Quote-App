@@ -9,6 +9,7 @@ Numbers are stored the way the Cloud API reports them: digits only, with
 country code, no '+' (e.g. 919941456453).
 """
 
+import contextlib
 import json
 import os
 import sqlite3
@@ -50,7 +51,21 @@ def normalize_number(text):
         return digits
 
 
+@contextlib.contextmanager
 def connect():
+        """Open the database for one block of work, then close it.
+
+        sqlite3's own `with` commits but leaves the handle open, which on
+        Windows keeps a lock on the file long after the work is done."""
+        connection = _open()
+        try:
+                with connection:
+                        yield connection
+        finally:
+                connection.close()
+
+
+def _open():
         paths.ensure_data_dir()
         connection = sqlite3.connect(DB_PATH, timeout=10)
         connection.row_factory = sqlite3.Row
@@ -100,6 +115,31 @@ def update_status(wamid, status, error=""):
                         "UPDATE messages SET status = ?, error = ? WHERE wamid = ?",
                         (status, error, wamid),
                 )
+
+
+def get_statuses(wamids):
+        """Latest delivery status for each of `wamids`, as {wamid: (status, error)}.
+
+        The bulk history stores only the id Meta handed back at send time; the
+        state that follows - delivered, read, failed - arrives later on the
+        status webhook and lands here."""
+        ids = [w for w in (wamids or []) if w]
+        if not ids:
+                return {}
+
+        statuses = {}
+        with connect() as connection:
+                # SQLite caps the number of bound variables, so ask in chunks.
+                for start in range(0, len(ids), 400):
+                        chunk = ids[start:start + 400]
+                        placeholders = ",".join("?" for _ in chunk)
+                        rows = connection.execute(
+                                f"SELECT wamid, status, error FROM messages WHERE wamid IN ({placeholders})",
+                                chunk,
+                        ).fetchall()
+                        for row in rows:
+                                statuses[row["wamid"]] = (row["status"] or "", row["error"] or "")
+        return statuses
 
 
 def describe_message(message):

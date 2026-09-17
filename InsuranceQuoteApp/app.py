@@ -276,7 +276,7 @@ def bulk_quote_campaigns():
 
 @app.get("/api/bulk-quote/sent-rows")
 def bulk_quote_sent_rows():
-	return jsonify({"rows": core.load_bulk_sent_history()})
+	return jsonify({"rows": core.bulk_sent_rows()})
 
 
 @app.post("/api/bulk-quote/upload")

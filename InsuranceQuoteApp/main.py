@@ -2963,6 +2963,45 @@ def record_bulk_send(entry):
         return entry
 
 
+# What Meta's status webhook reports, in the order a message moves through
+# them, mapped to what the history table shows.
+BULK_DELIVERY_LABELS = {
+        "sent": "Sent",
+        "delivered": "Delivered",
+        "read": "Read",
+        "failed": "Failed",
+}
+
+
+def bulk_sent_rows():
+        """The bulk history with each row's live delivery state filled in.
+
+        "Sent" in the history only ever meant "Meta accepted it". Whether the
+        message actually landed arrives afterwards on the status webhook, so it
+        is looked up here rather than frozen into the file at send time."""
+        history = load_bulk_sent_history()
+        statuses = chat.get_statuses([row.get("wamid", "") for row in history])
+
+        rows = []
+        for row in history:
+                row = dict(row)
+                status, error = statuses.get(row.get("wamid", ""), ("", ""))
+                if row.get("status") != "Sent":
+                        # Never accepted by Meta: there is nothing to follow up.
+                        row["delivery"] = "Failed"
+                        row["deliveryError"] = row.get("error", "")
+                elif status:
+                        row["delivery"] = BULK_DELIVERY_LABELS.get(status, status.title())
+                        row["deliveryError"] = error
+                else:
+                        # Accepted, but no webhook has been seen for it yet - either
+                        # it is still in flight or Meta dropped it silently.
+                        row["delivery"] = "Pending"
+                        row["deliveryError"] = ""
+                rows.append(row)
+        return rows
+
+
 def clear_bulk_sent_history():
         """Empty the bulk history. Returns the number of entries removed.
 
@@ -3151,6 +3190,9 @@ def send_bulk_quote_to_recipient(recipient_id, campaign_id=""):
                 "campaign": campaign["title"] if campaign else "Text only",
                 "status": "Failed",
                 "error": "",
+                # Meta's id for the message, so the delivery state that arrives
+                # later on the status webhook can be matched back to this row.
+                "wamid": "",
                 "sentAt": datetime.now(IST).strftime("%Y-%m-%d %I:%M %p"),
         }
 
@@ -3174,11 +3216,19 @@ def send_bulk_quote_to_recipient(recipient_id, campaign_id=""):
                 }, 200
 
         if campaign is None:
-                ok, error, _ = send_template_message(
+                ok, error, wamid = send_template_message(
                         person["mobileNumber"], WA_TEMPLATE_BULK_TEXT, []
                 )
+                if ok:
+                        # The image branch already files its send; the text one has
+                        # to as well, or the status webhook has no row to update.
+                        chat.save_message(
+                                wamid, person["mobileNumber"], "out",
+                                f"Bulk offer message sent to {person['name']}",
+                                status="sent",
+                        )
         else:
-                ok, error, _ = send_bulk_campaign_image(person, campaign)
+                ok, error, wamid = send_bulk_campaign_image(person, campaign)
 
         if not ok:
                 entry["error"] = error
@@ -3186,6 +3236,7 @@ def send_bulk_quote_to_recipient(recipient_id, campaign_id=""):
                 return {"success": False, "status": "Failed", "error": error}, 200
 
         entry["status"] = "Sent"
+        entry["wamid"] = wamid
         record_bulk_send(entry)
         return {"success": True, "status": "Sent", "error": "", "sentAt": entry["sentAt"]}, 200
 
@@ -3297,15 +3348,18 @@ def build_bulk_quote_content():
                 '<div class="card">'
                 '<div class="card-heading-row">'
                 '<h2>Bulk Send History</h2>'
+                '<div class="card-heading-actions">'
+                '<button id="bulkRefreshHistoryBtn" class="edit-btn" type="button">Refresh</button>'
                 '<button id="bulkClearHistoryBtn" class="delete-btn" type="button">Clear History</button>'
+                '</div>'
                 '</div>'
                 '<div class="table-scroll">'
                 '<table id="bulkSentTable">'
                 '<thead><tr>'
                 '<th>Name</th><th>List</th><th>Mobile Number</th><th>Vehicle</th>'
-                '<th>Campaign</th><th>Status</th><th>Sent Date/Time</th>'
+                '<th>Campaign</th><th>Status</th><th>Delivery</th><th>Sent Date/Time</th>'
                 '</tr></thead>'
-                '<tbody id="bulkSentBody"><tr><td colspan="7">No bulk messages sent yet.</td></tr></tbody>'
+                '<tbody id="bulkSentBody"><tr><td colspan="8">No bulk messages sent yet.</td></tr></tbody>'
                 '</table>'
                 '</div>'
                 '</div>'
@@ -3374,6 +3428,7 @@ BULK_QUOTE_SCRIPT = r"""
         var queueCurrent = document.getElementById("bulkQueueCurrent");
         var closeProgressBtn = document.getElementById("bulkCloseProgressBtn");
         var clearHistoryBtn = document.getElementById("bulkClearHistoryBtn");
+        var refreshHistoryBtn = document.getElementById("bulkRefreshHistoryBtn");
         var toastContainer = document.getElementById("toastContainer");
 
         function showToast(type, message) {
@@ -3505,14 +3560,28 @@ BULK_QUOTE_SCRIPT = r"""
                 updateSelection();
         }
 
+        // "Status" is what Meta said when the message was handed over; "Delivery"
+        // is what happened to it afterwards. They differ more often than they
+        // look like they should - an accepted message can still be dropped.
+        var DELIVERY_HINTS = {
+                Pending: "Accepted by WhatsApp, but no delivery confirmation yet.",
+                Sent: "Handed to WhatsApp; not confirmed on the handset yet.",
+                Delivered: "Reached the recipient's phone.",
+                Read: "Opened by the recipient.",
+                Failed: "WhatsApp could not deliver this message."
+        };
+
         function renderSent(rows) {
                 if (!rows.length) {
-                        sentBody.innerHTML = '<tr><td colspan="7">No bulk messages sent yet.</td></tr>';
+                        sentBody.innerHTML = '<tr><td colspan="8">No bulk messages sent yet.</td></tr>';
                         return;
                 }
                 sentBody.innerHTML = rows.map(function (row) {
                         var status = row.status || "Failed";
+                        var delivery = row.delivery || "Pending";
                         var title = row.error ? ' title="' + escapeHtml(row.error) + '"' : "";
+                        var deliveryNote = row.deliveryError || DELIVERY_HINTS[delivery] || "";
+                        var deliveryTitle = deliveryNote ? ' title="' + escapeHtml(deliveryNote) + '"' : "";
                         return "<tr>" +
                                 "<td>" + escapeHtml(row.name) + "</td>" +
                                 "<td>" + escapeHtml(row.list) + "</td>" +
@@ -3521,6 +3590,8 @@ BULK_QUOTE_SCRIPT = r"""
                                 "<td>" + escapeHtml(row.campaign) + "</td>" +
                                 '<td><span class="' + statusClass(status) + '"' + title + ">" +
                                 escapeHtml(status) + "</span></td>" +
+                                '<td><span class="' + statusClass(delivery) + '"' + deliveryTitle + ">" +
+                                escapeHtml(delivery) + "</span></td>" +
                                 "<td>" + escapeHtml(row.sentAt) + "</td>" +
                                 "</tr>";
                 }).join("");
@@ -3532,6 +3603,14 @@ BULK_QUOTE_SCRIPT = r"""
                         .then(function (data) { renderSent(data.rows || []); })
                         .catch(function () { /* history is not worth a toast */ });
         }
+
+        refreshHistoryBtn.addEventListener("click", loadSent);
+
+        // Delivery confirmations trickle in over the seconds and minutes after a
+        // send, so the history refreshes itself while the page is open.
+        setInterval(function () {
+                if (!document.hidden) loadSent();
+        }, 30000);
 
         [listSelect, segmentSelect, brandSelect, modelSelect].forEach(function (control) {
                 control.addEventListener("change", renderLeads);
@@ -4163,7 +4242,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         return
 
                 if parsed.path == "/api/bulk-quote/sent-rows":
-                        self.send_json_response(200, {"rows": load_bulk_sent_history()})
+                        self.send_json_response(200, {"rows": bulk_sent_rows()})
                         return
 
                 if parsed.path.startswith("/campaign-image/"):

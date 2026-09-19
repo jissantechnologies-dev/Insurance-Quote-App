@@ -581,6 +581,16 @@ class CooldownTests(unittest.TestCase):
                 self.history(priya["id"], days_ago=40)
                 self.assertFalse(self.person("Priya")["onCooldown"])
 
+        def test_the_window_is_a_week(self):
+                # Pins the default: the list is small, so a longer window would
+                # leave too few contacts to send to in a day.
+                self.assertEqual(self.main.BULK_MARKETING_COOLDOWN, timedelta(days=7))
+                priya = self.person("Priya")
+                self.history(priya["id"], days_ago=6)
+                self.assertTrue(self.person("Priya")["onCooldown"])
+                self.history(priya["id"], days_ago=8)
+                self.assertFalse(self.person("Priya")["onCooldown"])
+
         def test_a_rejected_send_does_not_start_a_cooldown(self):
                 # It never reached them, so it should not hold up the next run.
                 priya = self.person("Priya")

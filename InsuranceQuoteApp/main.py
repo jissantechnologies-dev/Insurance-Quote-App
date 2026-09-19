@@ -3264,8 +3264,12 @@ BULK_RETRY_AFTER = timedelta(hours=24)
 # into it is to stop sending the same people marketing templates week after
 # week. Anyone sent a bulk message inside this window is held back from the
 # next run, which keeps each day's recipients fresh.
+#
+# A week is the shortest gap that still spaces a contact out; it is set this
+# low because the contact list is small enough that a longer window leaves too
+# few people to send to in a day. Raise it if the list grows.
 BULK_MARKETING_COOLDOWN = timedelta(
-        days=int(os.environ.get("GI_BULK_COOLDOWN_DAYS", "28"))
+        days=int(os.environ.get("GI_BULK_COOLDOWN_DAYS", "7"))
 )
 
 

@@ -804,6 +804,21 @@ pre {
     background: linear-gradient(135deg, #fb923c, #c2410c);
 }
 
+/* Messaged too recently to send another marketing template. */
+.status-cooldown,
+.status-skipped {
+    background: linear-gradient(135deg, #94a3b8, #475569);
+}
+
+/* Replied in the last 24 hours: goes as a free-form message, never capped. */
+.status-open {
+    background: linear-gradient(135deg, #2dd4bf, #0d9488);
+}
+
+tr.is-cooldown {
+    opacity: 0.55;
+}
+
 .pagination-bar {
     display: flex;
     align-items: center;

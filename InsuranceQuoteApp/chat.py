@@ -283,3 +283,31 @@ def get_thread(number, limit=200):
                 }
                 for row in rows
         ]
+
+
+def last_inbound_map(numbers):
+        """{number: last inbound timestamp} for many numbers in one query.
+
+        window_state() per contact would be one query each, which the bulk page
+        does for every contact it lists. Numbers come back keyed the way they
+        were passed in, not normalised, so callers can look theirs up directly."""
+        wanted = {normalize_number(number): number for number in numbers if number}
+        if not wanted:
+                return {}
+
+        placeholders = ",".join("?" * len(wanted))
+        with connect() as connection:
+                rows = connection.execute(
+                        "SELECT number, MAX(timestamp) AS ts FROM messages"
+                        f" WHERE direction = 'in' AND number IN ({placeholders})"
+                        " GROUP BY number",
+                        tuple(wanted),
+                ).fetchall()
+        return {wanted[row["number"]]: row["ts"] for row in rows if row["ts"]}
+
+
+def window_open_at(timestamp, now=None):
+        """Whether an inbound message at `timestamp` still leaves the window open."""
+        if not timestamp:
+                return False
+        return int(timestamp) + CUSTOMER_WINDOW_SECONDS > (now or time.time())

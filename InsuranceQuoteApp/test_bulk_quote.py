@@ -16,6 +16,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -529,6 +530,93 @@ class BulkQuoteTests(unittest.TestCase):
                 self.assertIn(">Buses<", html)
                 self.assertIn(">Active Client<", html)
                 self.assertIn(">Lead<", html)
+
+
+class CooldownTests(unittest.TestCase):
+        """The per-recipient cooldown that keeps a run off recently-messaged
+        numbers, which is what Meta's frequency cap (131049) is applied to."""
+
+        def setUp(self):
+                self.temp = tempfile.TemporaryDirectory()
+                data_dir = Path(self.temp.name)
+                data_dir.joinpath("newcustomer.txt").write_text(
+                        "\n".join(LEAD_LINES), encoding="utf-8"
+                )
+                data_dir.joinpath("customers.json").write_text(
+                        json.dumps(ACTIVE_CUSTOMERS), encoding="utf-8"
+                )
+                self.main, self.campaigns = load_app(data_dir)
+                self.data_dir = data_dir
+
+        def tearDown(self):
+                self.temp.cleanup()
+                os.environ.pop("GI_DATA_DIR", None)
+
+        def history(self, recipient_id, days_ago, status="Sent"):
+                stamp = datetime.now(self.main.IST) - timedelta(days=days_ago)
+                self.data_dir.joinpath("sent_bulk_quote.json").write_text(
+                        json.dumps([{
+                                "recipientId": recipient_id,
+                                "status": status,
+                                "retries": 0,
+                                "lastAttemptAt": stamp.isoformat(timespec="seconds"),
+                                "sentAt": stamp.strftime("%Y-%m-%d %I:%M %p"),
+                                "wamid": "wamid.TEST",
+                        }]),
+                        encoding="utf-8",
+                )
+
+        def person(self, name):
+                return next(
+                        p for p in self.main.load_bulk_recipients() if p["name"] == name
+                )
+
+        def test_someone_messaged_yesterday_is_on_cooldown(self):
+                priya = self.person("Priya")
+                self.history(priya["id"], days_ago=1)
+                self.assertTrue(self.person("Priya")["onCooldown"])
+
+        def test_someone_messaged_long_ago_is_not(self):
+                priya = self.person("Priya")
+                self.history(priya["id"], days_ago=40)
+                self.assertFalse(self.person("Priya")["onCooldown"])
+
+        def test_a_rejected_send_does_not_start_a_cooldown(self):
+                # It never reached them, so it should not hold up the next run.
+                priya = self.person("Priya")
+                self.history(priya["id"], days_ago=1, status="Failed")
+                self.assertFalse(self.person("Priya")["onCooldown"])
+
+        def test_an_open_service_window_overrides_the_cooldown(self):
+                # A free-form reply is not a template, so no cap applies.
+                priya = self.person("Priya")
+                self.history(priya["id"], days_ago=1)
+                self.main.chat.save_message(
+                        "wamid.IN", priya["mobileNumber"], "in", "Is my policy due?"
+                )
+                refreshed = self.person("Priya")
+                self.assertTrue(refreshed["freeForm"])
+                self.assertFalse(refreshed["onCooldown"])
+
+        def test_sending_to_a_cooled_down_contact_is_skipped_not_recorded(self):
+                priya = self.person("Priya")
+                self.history(priya["id"], days_ago=1)
+                before = len(self.main.load_bulk_sent_history())
+
+                payload, status_code = self.main.send_bulk_quote_to_recipient(priya["id"])
+                self.assertEqual(status_code, 200)
+                self.assertEqual(payload["status"], "Skipped")
+                self.assertFalse(payload["success"])
+                # A skip is not an attempt, so the history must not grow.
+                self.assertEqual(len(self.main.load_bulk_sent_history()), before)
+
+        def test_force_overrides_the_cooldown(self):
+                priya = self.person("Priya")
+                self.history(priya["id"], days_ago=1)
+                payload, _ = self.main.send_bulk_quote_to_recipient(
+                        priya["id"], force=True
+                )
+                self.assertNotEqual(payload["status"], "Skipped")
 
 
 if __name__ == "__main__":

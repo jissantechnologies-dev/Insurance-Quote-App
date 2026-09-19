@@ -205,5 +205,41 @@ class ImageTemplate(unittest.TestCase):
                 self.assertIn("132001", error)
 
 
+class FreeFormImage(unittest.TestCase):
+        """The in-window send. It is not a template, which is the whole point:
+        the marketing frequency cap (131049) cannot hold it back."""
+
+        def payload_for(self, caption=""):
+                with stub_post(RecordingPost(parsed={"messages": [{"id": "wamid.F"}]})) as post:
+                        self.result = whatsapp_media.send_image_message(
+                                "919941456453", "media-123", "TOKEN", "PHONE_ID",
+                                caption=caption, graph_version="v23.0",
+                        )
+                return json.loads(post.last["data"].decode("utf-8"))
+
+        def test_sends_a_plain_image_not_a_template(self):
+                payload = self.payload_for()
+                self.assertEqual(self.result, (True, "wamid.F", ""))
+                self.assertEqual(payload["type"], "image")
+                self.assertNotIn("template", payload)
+                self.assertEqual(payload["image"]["id"], "media-123")
+
+        def test_a_blank_caption_is_left_out(self):
+                self.assertNotIn("caption", self.payload_for("   ")["image"])
+
+        def test_a_caption_is_flattened_to_one_line(self):
+                payload = self.payload_for("Thanks\n  Gravity  Team")
+                self.assertEqual(payload["image"]["caption"], "Thanks Gravity Team")
+
+        def test_send_failure_yields_no_wamid(self):
+                with stub_post(RecordingPost(ok=False, error="Boom")):
+                        self.assertEqual(
+                                whatsapp_media.send_image_message(
+                                        "919941456453", "media-123", "TOKEN", "PHONE_ID",
+                                ),
+                                (False, "", "Boom"),
+                        )
+
+
 if __name__ == "__main__":
         unittest.main()

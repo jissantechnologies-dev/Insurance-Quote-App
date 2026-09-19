@@ -294,7 +294,8 @@ def bulk_quote_upload():
 def bulk_quote_send():
 	data = request.get_json(silent=True) or {}
 	payload, status_code = core.send_bulk_quote_to_recipient(
-		str(data.get("id", "")), str(data.get("campaignId", "") or "")
+		str(data.get("id", "")), str(data.get("campaignId", "") or ""),
+		force=bool(data.get("force")),
 	)
 	return jsonify(payload), status_code
 

@@ -165,3 +165,32 @@ def send_image_template(number, template_name, media_id, values, token, phone_nu
         if not ok:
                 return False, "", error
         return True, (parsed.get("messages") or [{}])[0].get("id", ""), ""
+
+
+def send_image_message(number, media_id, token, phone_number_id,
+                       caption="", graph_version="v23.0", timeout=30):
+        """Send an already-uploaded image as a free-form message.
+
+        Only valid inside the 24-hour customer service window, where it is not
+        a template and so is exempt from the marketing frequency cap that has
+        Meta dropping accepted bulk templates (error 131049).
+        Returns (ok, wamid, error)."""
+        image = {"id": media_id}
+        if str(caption or "").strip():
+                image["caption"] = " ".join(str(caption).split())
+        payload = {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": number,
+                "type": "image",
+                "image": image,
+        }
+        ok, parsed, error = _post(
+                f"{GRAPH_HOST}/{graph_version}/{phone_number_id}/messages",
+                json.dumps(payload).encode("utf-8"),
+                {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                timeout,
+        )
+        if not ok:
+                return False, "", error
+        return True, (parsed.get("messages") or [{}])[0].get("id", ""), ""

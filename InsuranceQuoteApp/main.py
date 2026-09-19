@@ -2947,6 +2947,13 @@ BULK_SENT_PATH = paths.data_path("sent_bulk_quote.json")
 # this server (local development). Templates carry their own wording.
 BULK_FALLBACK_MESSAGE = "Thanks - Gravity Insurance Team"
 
+# What a free-form send inside the 24-hour window says. It is not a template,
+# so unlike the bulk templates this wording can be changed freely - it needs no
+# approval from Meta.
+BULK_FREE_FORM_CAPTION = os.environ.get(
+        "GI_WA_BULK_CAPTION", "Thanks - Gravity Insurance Team"
+)
+
 
 def load_bulk_sent_history():
         return load_json_list(BULK_SENT_PATH)
@@ -3090,6 +3097,28 @@ def load_bulk_recipients():
                                         continue
                                 seen.add(recipient["id"])
                         recipients.append(recipient)
+        return annotate_bulk_cooldown(recipients)
+
+
+def annotate_bulk_cooldown(recipients):
+        """Mark who was messaged too recently to be sent another template.
+
+        A recipient whose 24-hour service window is open is never on cooldown:
+        they get a free-form message, which the frequency cap does not touch."""
+        last_marketed = bulk_last_marketed()
+        inbound = chat.last_inbound_map(
+                [person["mobileNumber"] for person in recipients]
+        )
+        now = datetime.now(IST)
+
+        for person in recipients:
+                stamp = last_marketed.get(person["id"])
+                free_form = chat.window_open_at(inbound.get(person["mobileNumber"]))
+                due = stamp + BULK_MARKETING_COOLDOWN if stamp else None
+                person["freeForm"] = free_form
+                person["lastMarketedAt"] = stamp.strftime("%Y-%m-%d") if stamp else ""
+                person["cooldownUntil"] = due.strftime("%Y-%m-%d") if due else ""
+                person["onCooldown"] = bool(due and now < due and not free_form)
         return recipients
 
 
@@ -3157,16 +3186,29 @@ def send_bulk_campaign_image(person, campaign):
         A cached media id that Meta has since expired looks like any other send
         failure, so one retry clears the cache and re-uploads before giving
         up."""
+        # Inside the 24-hour service window the picture can go as a plain image
+        # rather than a marketing template, which is what the frequency cap
+        # (131049) is applied to. Same picture, but it cannot be held back.
+        free_form = chat.window_state(person["mobileNumber"])["open"]
+
         for attempt in (0, 1):
                 media_id, error = get_campaign_media_id(campaign)
                 if not media_id:
                         return False, error, ""
 
-                ok, wamid, error = whatsapp_media.send_image_template(
-                        person["mobileNumber"], WA_TEMPLATE_BULK_IMAGE, media_id, [],
-                        WA_TOKEN, WA_PHONE_NUMBER_ID,
-                        language=WA_TEMPLATE_LANGUAGE, graph_version=WA_GRAPH_VERSION,
-                )
+                if free_form:
+                        ok, wamid, error = whatsapp_media.send_image_message(
+                                person["mobileNumber"], media_id,
+                                WA_TOKEN, WA_PHONE_NUMBER_ID,
+                                caption=BULK_FREE_FORM_CAPTION,
+                                graph_version=WA_GRAPH_VERSION,
+                        )
+                else:
+                        ok, wamid, error = whatsapp_media.send_image_template(
+                                person["mobileNumber"], WA_TEMPLATE_BULK_IMAGE, media_id, [],
+                                WA_TOKEN, WA_PHONE_NUMBER_ID,
+                                language=WA_TEMPLATE_LANGUAGE, graph_version=WA_GRAPH_VERSION,
+                        )
                 if ok:
                         chat.save_message(
                                 wamid, person["mobileNumber"], "out",
@@ -3189,9 +3231,16 @@ def deliver_bulk_message(person, campaign):
         if campaign is not None:
                 return send_bulk_campaign_image(person, campaign)
 
-        ok, error, wamid = send_template_message(
-                person["mobileNumber"], WA_TEMPLATE_BULK_TEXT, []
-        )
+        if chat.window_state(person["mobileNumber"])["open"]:
+                # Free-form inside the window: not a template, so not subject to
+                # the marketing frequency cap. See send_bulk_campaign_image.
+                ok, error, wamid = send_whatsapp_text(
+                        person["mobileNumber"], BULK_FREE_FORM_CAPTION
+                )
+        else:
+                ok, error, wamid = send_template_message(
+                        person["mobileNumber"], WA_TEMPLATE_BULK_TEXT, []
+                )
         if ok:
                 # The image branch already files its send; the text one has
                 # to as well, or the status webhook has no row to update.
@@ -3210,6 +3259,30 @@ def deliver_bulk_message(person, campaign):
 # number, a blocked account) would just fail the same way again.
 BULK_RETRY_MAX = 2
 BULK_RETRY_AFTER = timedelta(hours=24)
+
+# The cap is applied per person, not per business, so the way to stop running
+# into it is to stop sending the same people marketing templates week after
+# week. Anyone sent a bulk message inside this window is held back from the
+# next run, which keeps each day's recipients fresh.
+BULK_MARKETING_COOLDOWN = timedelta(
+        days=int(os.environ.get("GI_BULK_COOLDOWN_DAYS", "28"))
+)
+
+
+def bulk_last_marketed():
+        """{recipientId: datetime} of the last bulk message each person was sent.
+
+        Only accepted sends count. A row Meta rejected outright never reached
+        the person, so it should not keep them out of the next run."""
+        last = {}
+        for row in load_bulk_sent_history():
+                recipient_id = str(row.get("recipientId") or "")
+                if not recipient_id or row.get("status") != "Sent":
+                        continue
+                stamp = bulk_last_attempt(row)
+                if stamp is not None and stamp > last.get(recipient_id, stamp - timedelta(seconds=1)):
+                        last[recipient_id] = stamp
+        return last
 
 
 def is_retryable_bulk_error(error):
@@ -3336,7 +3409,7 @@ def retry_bulk_failures(now=None, dry_run=False):
         return summary
 
 
-def send_bulk_quote_to_recipient(recipient_id, campaign_id=""):
+def send_bulk_quote_to_recipient(recipient_id, campaign_id="", force=False):
         """Send one person their copy of the campaign. Returns (payload, status).
 
         Every attempt is written to the history file, successes and failures
@@ -3375,6 +3448,19 @@ def send_bulk_quote_to_recipient(recipient_id, campaign_id=""):
                 entry["error"] = "No usable name or mobile number."
                 record_bulk_send(entry)
                 return {"success": False, "status": "Failed", "error": entry["error"]}, 200
+
+        if person.get("onCooldown") and not force:
+                # Not recorded in the history: nothing was sent, and a run of 50
+                # would otherwise bury the real attempts under skipped rows.
+                return {
+                        "success": False,
+                        "status": "Skipped",
+                        "error": (
+                                f"Last messaged {person['lastMarketedAt']}. Sending again "
+                                f"before {person['cooldownUntil']} risks WhatsApp holding "
+                                "it back for frequency capping."
+                        ),
+                }, 200
 
         if not cloud_api_configured():
                 # Local development: hand back a wa.me link instead of failing,
@@ -3560,6 +3646,7 @@ BULK_QUOTE_SCRIPT = r"""
                 queueIndex: 0,
                 sentCount: 0,
                 failedCount: 0,
+                skippedCount: 0,
                 rowStatus: {}
         };
 
@@ -3644,7 +3731,21 @@ BULK_QUOTE_SCRIPT = r"""
                                 var status = lead.valid
                                         ? (state.rowStatus[lead.id] || "Pending")
                                         : "Invalid";
-                                return "<tr>" +
+                                var note = "";
+                                if (lead.valid && !state.rowStatus[lead.id]) {
+                                        if (lead.onCooldown) {
+                                                status = "Cooldown";
+                                                note = "Last messaged " + lead.lastMarketedAt +
+                                                        ". Sending before " + lead.cooldownUntil +
+                                                        " risks WhatsApp holding it back.";
+                                        } else if (lead.freeForm) {
+                                                status = "Open";
+                                                note = "Replied within 24 hours, so this goes as a " +
+                                                        "normal message - no frequency cap applies.";
+                                        }
+                                }
+                                var noteTitle = note ? ' title="' + escapeHtml(note) + '"' : "";
+                                return '<tr' + (lead.onCooldown ? ' class="is-cooldown"' : "") + ">" +
                                         '<td><input type="checkbox" class="bulk-row-check" data-id="' +
                                         escapeHtml(lead.id) + '"' + checked + disabled + " /></td>" +
                                         "<td>" + escapeHtml(lead.name) + "</td>" +
@@ -3653,12 +3754,17 @@ BULK_QUOTE_SCRIPT = r"""
                                         "<td>" + escapeHtml(lead.segment) + "</td>" +
                                         "<td>" + escapeHtml(lead.carBrand) + "</td>" +
                                         "<td>" + escapeHtml(lead.carModel) + "</td>" +
-                                        '<td><span class="' + statusClass(status) + '">' + escapeHtml(status) + "</span></td>" +
+                                        '<td><span class="' + statusClass(status) + '"' + noteTitle + ">" +
+                                        escapeHtml(status) + "</span></td>" +
                                         "</tr>";
                         }).join("");
                 }
 
-                var selectable = leads.filter(function (lead) { return lead.valid; });
+                // Cooled-down contacts are left out of select-all rather than
+                // disabled, so a deliberate one-off resend is still possible.
+                var selectable = leads.filter(function (lead) {
+                        return lead.valid && !lead.onCooldown;
+                });
                 selectAll.checked = selectable.length > 0 && selectable.every(function (lead) {
                         return state.selectedIds.has(lead.id);
                 });
@@ -3805,6 +3911,7 @@ BULK_QUOTE_SCRIPT = r"""
                 // narrowed to "Bus" cannot accidentally message every lead.
                 getFilteredRecipients().forEach(function (lead) {
                         if (!lead.valid) return;
+                        if (lead.onCooldown && selectAll.checked) return;
                         if (selectAll.checked) {
                                 state.selectedIds.add(lead.id);
                         } else {
@@ -3926,6 +4033,7 @@ BULK_QUOTE_SCRIPT = r"""
                 state.queueIndex = 0;
                 state.sentCount = 0;
                 state.failedCount = 0;
+                state.skippedCount = 0;
                 progressModal.classList.remove("is-hidden");
                 progressBar.style.width = "0%";
                 renderQueueStep();
@@ -3938,14 +4046,18 @@ BULK_QUOTE_SCRIPT = r"""
 
         function renderQueueStep() {
                 var total = state.queue.length;
-                var processed = state.sentCount + state.failedCount;
+                var processed = state.sentCount + state.failedCount + state.skippedCount;
                 progressBar.style.width = (total ? (processed / total) * 100 : 0) + "%";
                 progressText.textContent = processed + " / " + total + " Sent";
 
                 if (state.queueIndex >= total) {
+                        var skipNote = state.skippedCount
+                                ? ", " + state.skippedCount + " skipped (messaged too recently)"
+                                : "";
                         queueCurrent.innerHTML = "<p><strong>All done.</strong> " + state.sentCount +
-                                " sent, " + state.failedCount + " failed.</p>";
-                        showToast("success", state.sentCount + " message(s) sent, " + state.failedCount + " failed.");
+                                " sent, " + state.failedCount + " failed" + skipNote + ".</p>";
+                        showToast("success", state.sentCount + " message(s) sent, " +
+                                state.failedCount + " failed" + skipNote + ".");
                         renderLeads();
                         loadSent();
                         return;
@@ -3973,6 +4085,12 @@ BULK_QUOTE_SCRIPT = r"""
                                 if (data.success) {
                                         state.sentCount += 1;
                                         state.rowStatus[lead.id] = "Sent";
+                                        state.selectedIds.delete(lead.id);
+                                } else if (data.status === "Skipped") {
+                                        // Held back by the cooldown, not a failure: nothing was
+                                        // sent, so it stays selectable for a deliberate resend.
+                                        state.skippedCount += 1;
+                                        state.rowStatus[lead.id] = "Skipped";
                                         state.selectedIds.delete(lead.id);
                                 } else {
                                         state.failedCount += 1;
@@ -4199,7 +4317,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 if self.path == "/api/bulk-quote/send":
                         data = self.read_json_body()
                         payload, status_code = send_bulk_quote_to_recipient(
-                                str(data.get("id", "")), str(data.get("campaignId", "") or "")
+                                str(data.get("id", "")), str(data.get("campaignId", "") or ""),
+                                force=bool(data.get("force")),
                         )
                         self.send_json_response(status_code, payload)
                         return
